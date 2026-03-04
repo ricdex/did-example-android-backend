@@ -1,0 +1,35 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    # Desarrollo local: H2 por defecto. Producción: sobreescribir con env vars.
+    url:                ${SPRING_DATASOURCE_URL:jdbc:h2:file:./data/did_issuer;AUTO_SERVER=TRUE}
+    driver-class-name:  ${SPRING_DATASOURCE_DRIVER:org.h2.Driver}
+    username:           ${SPRING_DATASOURCE_USERNAME:sa}
+    password:           ${SPRING_DATASOURCE_PASSWORD:}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    database-platform:  ${JPA_DIALECT:org.hibernate.dialect.H2Dialect}
+  h2:
+    console:
+      enabled: ${H2_CONSOLE_ENABLED:true}   # Sólo dev — en prod se desactiva
+      path: /h2-console
+
+# Configuración del emisor DID
+issuer:
+  # Ruta del PEM local (dev). En producción se usa la env var ISSUER_KEY_PEM.
+  key-file: ./data/issuer_key.pem
+  # URL pública del emisor. En producción sobreescribir con ISSUER_BASE_URL.
+  base-url: ${ISSUER_BASE_URL:http://localhost:8080}
+  # Validez de las VCs emitidas (segundos)
+  vc-ttl-seconds: 86400       # 24 horas
+  # Validez de los nonces (segundos)
+  nonce-ttl-seconds: 300      # 5 minutos
+
+logging:
+  level:
+    com.did: DEBUG
+    root: INFO

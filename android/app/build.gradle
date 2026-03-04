@@ -1,0 +1,61 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.did.wallet'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.did.wallet"
+        minSdk 26          // Android 8.0 — mínimo para Keystore AES-GCM confiable
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    // Evitar conflictos de duplicados con BouncyCastle
+    packagingOptions {
+        exclude 'META-INF/BCKEY.SF'
+        exclude 'META-INF/BCKEY.DSA'
+        exclude 'META-INF/BC2048KE.SF'
+        exclude 'META-INF/BC2048KE.DSA'
+        exclude 'META-INF/INDEX.LIST'
+        exclude 'META-INF/io.netty.versions.properties'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+
+    // BouncyCastle completo (secp256k1, ECDSA, RFC6979)
+    // Reemplaza al BC recortado de Android
+    implementation 'org.bouncycastle:bcprov-jdk15to18:1.78.1'
+    implementation 'org.bouncycastle:bcpkix-jdk15to18:1.78.1'
+
+    // Jetpack Security: EncryptedSharedPreferences para VCs cifradas en disco
+    // MasterKey usa Android Keystore internamente (StrongBox → TEE → Software)
+    implementation 'androidx.security:security-crypto:1.0.0'
+}
+
+// Forzar versión única de BouncyCastle en todo el grafo de dependencias
+configurations.all {
+    resolutionStrategy.eachDependency { details ->
+        if (details.requested.group == 'org.bouncycastle') {
+            details.useVersion '1.78.1'
+        }
+    }
+}

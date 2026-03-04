@@ -1,0 +1,93 @@
+# =====================
+# Java / Maven (backend)
+# =====================
+backend/target/
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+
+# Maven wrapper
+.mvn/wrapper/maven-wrapper.jar
+
+# =====================
+# Android / Gradle
+# =====================
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/*.iml
+android/**/*.iml
+
+# Gradle wrapper
+!gradle/wrapper/gradle-wrapper.jar
+
+# =====================
+# Test results & coverage
+# =====================
+reports/
+**/surefire-reports/
+**/failsafe-reports/
+**/jacoco/
+**/jacoco.exec
+**/coverage/
+**/.nyc_output/
+**/test-results/
+**/test-output/
+*.xml.bak
+
+# Android test results
+android/**/outputs/
+android/**/test-results/
+
+# =====================
+# IDEs
+# =====================
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+*~
+
+# =====================
+# OS
+# =====================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# =====================
+# Secrets / Config local
+# =====================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.keystore
+secrets/
+local.properties
+
+# =====================
+# Docker
+# =====================
+docker/data/
+docker/volumes/
+
+# =====================
+# Logs
+# =====================
+*.log
+logs/

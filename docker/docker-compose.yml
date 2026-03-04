@@ -1,0 +1,21 @@
+services:
+  did-issuer:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      # Persiste la clave del emisor y la DB H2 entre reinicios del contenedor
+      - did_data:/app/data
+    environment:
+      - SPRING_PROFILES_ACTIVE=default
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/issuer/did"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  did_data:
