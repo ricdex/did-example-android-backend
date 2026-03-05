@@ -3,11 +3,11 @@ package com.did.issuer.controller;
 import com.did.issuer.config.IssuerKeyConfig.IssuerKeys;
 import com.did.issuer.dto.CredentialRequest;
 import com.did.issuer.model.CredentialRecord;
-import com.did.issuer.repository.CredentialRepository;
 import com.did.issuer.service.CredentialIssuerService;
 import com.did.issuer.service.DIDKeyUtil;
 import com.did.issuer.service.NonceService;
 import com.did.issuer.service.ProofVerifier;
+import com.did.issuer.store.CredentialStore;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,23 +30,23 @@ public class CredentialController {
 
     private static final Logger log = LoggerFactory.getLogger(CredentialController.class);
 
-    private final NonceService          nonceService;
-    private final ProofVerifier         proofVerifier;
+    private final NonceService            nonceService;
+    private final ProofVerifier           proofVerifier;
     private final CredentialIssuerService issuerService;
-    private final CredentialRepository  repository;
-    private final IssuerKeys            issuerKeys;
+    private final CredentialStore         store;
+    private final IssuerKeys              issuerKeys;
 
     public CredentialController(
         NonceService nonceService,
         ProofVerifier proofVerifier,
         CredentialIssuerService issuerService,
-        CredentialRepository repository,
+        CredentialStore store,
         IssuerKeys issuerKeys
     ) {
         this.nonceService  = nonceService;
         this.proofVerifier = proofVerifier;
         this.issuerService = issuerService;
-        this.repository    = repository;
+        this.store         = store;
         this.issuerKeys    = issuerKeys;
     }
 
@@ -108,7 +108,7 @@ public class CredentialController {
     public ResponseEntity<List<Map<String, Object>>> listByHolder(
         @RequestParam("holder_did") String holderDid
     ) {
-        List<Map<String, Object>> result = repository.findByHolderDid(holderDid).stream()
+        List<Map<String, Object>> result = store.findByHolderDid(holderDid).stream()
             .map(r -> Map.<String, Object>of(
                 "credential_id",   r.getCredentialId(),
                 "credential_type", r.getCredentialType(),
@@ -119,6 +119,23 @@ public class CredentialController {
             ))
             .toList();
         return ResponseEntity.ok(result);
+    }
+
+    // ── Revocación ───────────────────────────────────────────────────────────
+
+    /**
+     * Revoca una VC por su ID.
+     * El credentialId puede contener colones (urn:uuid:...), por eso :.+
+     *
+     * @return 204 si se revocó, 404 si no existe
+     */
+    @PostMapping("/credentials/{credentialId:.+}/revoke")
+    public ResponseEntity<Void> revoke(@PathVariable String credentialId) {
+        log.info("Solicitud de revocación: {}", credentialId);
+        boolean revoked = store.revoke(credentialId);
+        return revoked
+            ? ResponseEntity.noContent().build()
+            : ResponseEntity.notFound().build();
     }
 
     // ── Info del emisor ───────────────────────────────────────────────────────

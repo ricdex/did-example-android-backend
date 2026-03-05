@@ -12,8 +12,40 @@ Azure Functions es serverless pero no es adecuado para Spring Boot:
 **Azure Container Apps** es la alternativa serverless para contenedores:
 - Escala a 0 réplicas cuando no hay tráfico (coste cero en reposo)
 - Usa el Dockerfile existente sin modificaciones al código
-- Integración nativa con Key Vault mediante Managed Identity
-- Elimina credenciales del código — el contenedor nunca ve las contraseñas directamente
+- Integración nativa con Key Vault y Table Storage mediante Managed Identity
+- Elimina credenciales del código — el contenedor nunca ve contraseñas directamente
+
+---
+
+## Por qué Azure Table Storage (no PostgreSQL)
+
+PostgreSQL en Azure tiene inconvenientes importantes para este proyecto:
+
+| | PostgreSQL Flexible Server | Azure Table Storage |
+|---|---|---|
+| Tiempo de provisión | 5–10 minutos | Segundos |
+| Costo mínimo | ~$15/mes (Burstable B1ms) | ~$0 para un demo |
+| Modo serverless | No disponible en Azure | Nativo |
+| Gestión | Requiere servidor activo | Totalmente gestionado |
+| Autenticación | Usuario/contraseña | Managed Identity (RBAC) |
+
+**Azure Table Storage** almacena los metadatos de las VCs emitidas (sin JPA, sin servidor):
+- PartitionKey: `"credentials"` (fijo)
+- RowKey: `credentialId` (= `urn:uuid:...`)
+- Campos: `holderDid`, `issuerDid`, `credentialType`, `vcJwtHash`, `issuedAt`, `expiresAt`, `revoked`
+
+### Lógica de activación (sin cambios al código)
+
+```
+Sin AZURE_STORAGE_ACCOUNT_NAME (local dev)
+  → azure.storage.account-name = "" → AzureTableCredentialStore: NO se crea
+  → JpaCredentialStore SE crea → usa H2 vía JPA (comportamiento actual)
+
+Con AZURE_STORAGE_ACCOUNT_NAME=didissuerabc (Azure Container Apps)
+  → AzureTableCredentialStore SE crea → usa Managed Identity para Table Storage
+  → JpaCredentialStore NO se crea
+  → H2 sigue inicializando (JPA en classpath) pero nadie escribe en él → inofensivo
+```
 
 ---
 
@@ -28,14 +60,13 @@ Azure Functions es serverless pero no es adecuado para Spring Boot:
                     │  • max replicas: 3                           │
                     └───────────┬─────────────────────┬───────────┘
                                 │                     │
-                  Managed Identity                JDBC/SSL
-                    (sin password)                    │
-                                │                     ▼
-                    ┌───────────▼───────┐   ┌─────────────────────┐
-                    │   Azure Key Vault  │   │  Azure PostgreSQL    │
-                    │                   │   │  Flexible Server     │
-                    │  issuer-key-pem   │   │  did_issuer DB       │
-                    │  pg-password      │   │  (Burstable B1ms)    │
+                  Managed Identity             Managed Identity
+                    (sin password)              (sin password)
+                                │                     │
+                    ┌───────────▼───────┐   ┌─────────▼───────────┐
+                    │   Azure Key Vault  │   │  Azure Table Storage │
+                    │                   │   │                      │
+                    │  issuer-key-pem   │   │  tabla: credentials  │
                     └───────────────────┘   └─────────────────────┘
 
                     ┌───────────────────┐
@@ -49,15 +80,22 @@ Azure Functions es serverless pero no es adecuado para Spring Boot:
 
 ```
 Key Vault
-  ├── issuer-key-pem  (PEM en base64 de la clave secp256k1 del emisor)
-  └── pg-password     (contraseña generada al desplegar)
+  └── issuer-key-pem  (PEM en base64 de la clave secp256k1 del emisor)
          │
-         │  Container Apps los inyecta como env vars
+         │  Container Apps lo inyecta como env var
          │  usando la Managed Identity (RBAC: Key Vault Secrets User)
          ▼
 Container App
-  ├── ISSUER_KEY_PEM          → IssuerKeyConfig lo decodifica (base64 → PEM)
-  └── SPRING_DATASOURCE_PASSWORD → Spring lo usa para conectar a PostgreSQL
+  └── ISSUER_KEY_PEM  → IssuerKeyConfig lo decodifica (base64 → PEM)
+
+Table Storage
+  └── tabla: credentials
+         │
+         │  AzureTableCredentialStore usa DefaultAzureCredential
+         │  (RBAC: Storage Table Data Contributor sobre el Storage Account)
+         ▼
+Container App
+  └── AZURE_STORAGE_ACCOUNT_NAME  → AzureTableCredentialStore construye el TableClient
 ```
 
 ---
@@ -66,7 +104,7 @@ Container App
 
 - **Azure CLI** instalado y autenticado: `az login`
 - **openssl** (disponible en macOS/Linux por defecto)
-- **python3** (para generar el sufijo único y contraseñas)
+- **python3** (para generar el sufijo único)
 - Una **suscripción Azure** activa
 
 Instalar Azure CLI:
@@ -104,17 +142,16 @@ RESOURCE_GROUP=mi-rg LOCATION=westeurope ./scripts/deploy-azure.sh
 | 1 | Crear Resource Group | Contenedor lógico para todos los recursos |
 | 2 | Crear Azure Container Registry | Almacena la imagen Docker de forma privada |
 | 3 | Build de la imagen en ACR | No requiere Docker local — ACR compila en la nube |
-| 4 | Crear Key Vault | Almacena secretos de forma segura |
+| 4 | Crear Key Vault | Almacena la clave privada del emisor de forma segura |
 | 5 | Generar clave secp256k1 del emisor | Clave privada nunca toca disco local, va directo a Key Vault |
-| 6 | Crear PostgreSQL Flexible Server | Base de datos gestionada en lugar de H2 de desarrollo |
-| 7 | Crear Managed Identity | Identidad que el contenedor usa para autenticarse ante Key Vault |
-| 8 | Asignar rol Key Vault Secrets User | Permisos mínimos (RBAC) — solo lectura de secrets |
+| 6 | Crear Storage Account + tabla `credentials` | Persistencia serverless de metadatos VC (~$0 para un demo) |
+| 7 | Crear Managed Identity | Identidad que el contenedor usa ante Key Vault y Table Storage |
+| 8 | Asignar roles RBAC | `Key Vault Secrets User` + `Storage Table Data Contributor` — mínimo privilegio |
 | 9 | Crear Container Apps Environment | Plataforma serverless donde vive el contenedor |
 | 10 | Desplegar Container App | El backend arranca con los secretos inyectados |
 | 11 | Actualizar URL del emisor | El DID del issuer incluye su propia URL pública |
-| 12 | Guardar outputs | Escribe `.azure-deploy-output.env` con todas las URLs y nombres |
 
-Duración estimada: **12–20 minutos** (PostgreSQL es el paso más lento).
+Duración estimada: **3–5 minutos** (sin PostgreSQL, el paso más lento era la BD).
 
 ---
 
@@ -134,20 +171,12 @@ Ejemplo del bloque de endpoints que aparece en pantalla:
 │  Base URL:                                              │
 │  https://did-issuer-app.azurecontainerapps.io           │
 │                                                         │
-│  Nonce (paso 1 para solicitar VC):                      │
-│  GET https://.../credentials/nonce                      │
-│                                                         │
-│  Emisión de VC (paso 2):                                │
-│  POST https://.../credentials/issue                     │
-│                                                         │
-│  Metadatos de VCs del holder:                           │
-│  GET https://.../credentials?holder_did={did}           │
-│                                                         │
-│  DID del emisor (para configurar la app):               │
-│  GET https://.../issuer/did                             │
-│                                                         │
-│  DID del emisor (para hardcodear en la app):            │
-│  did:key:zQ3s...                                        │
+│  GET  /credentials/nonce           (paso 1, pedir VC)  │
+│  POST /credentials/issue           (paso 2, emitir VC) │
+│  GET  /credentials?holder_did=     (metadatos)         │
+│  POST /credentials/{id}/revoke     (revocar VC)        │
+│  GET  /issuer/did                  (info del emisor)   │
+│  GET  /issuer/did-document         (DID Document W3C)  │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -158,14 +187,14 @@ Ejemplo del bloque de endpoints que aparece en pantalla:
 # Leer URL del despliegue
 source .azure-deploy-output.env
 
-# Verificar que el backend responde (el script ya espera el cold start)
+# Verificar que el backend responde
 curl $APP_URL/issuer/did | jq .
 
 # Ver el archivo para el equipo mobile
 cat mobile-config.txt
 
 # Ejecutar las pruebas de integración completas contra Azure
-./scripts/test-integration.sh $APP_URL
+./scripts/run-tests.sh cloud $APP_URL
 
 # Ver logs en tiempo real
 az containerapp logs show \
@@ -192,14 +221,23 @@ El Container App recibe estas variables automáticamente (gestionadas por el scr
 
 | Variable | Fuente | Propósito |
 |----------|--------|-----------|
-| `ISSUER_KEY_PEM` | Key Vault secret | PEM base64 de la clave secp256k1 del emisor |
-| `SPRING_DATASOURCE_URL` | Script (JDBC URL de PostgreSQL) | Conexión a la base de datos |
-| `SPRING_DATASOURCE_USERNAME` | Script | Usuario de PostgreSQL |
-| `SPRING_DATASOURCE_PASSWORD` | Key Vault secret | Contraseña de PostgreSQL |
-| `SPRING_DATASOURCE_DRIVER` | Script | `org.postgresql.Driver` |
-| `JPA_DIALECT` | Script | `org.hibernate.dialect.PostgreSQLDialect` |
+| `ISSUER_KEY_PEM` | Key Vault secret `issuer-key-pem` | PEM base64 de la clave secp256k1 del emisor |
+| `AZURE_STORAGE_CONNECTION_STRING` | Key Vault secret `storage-connection-string` | Connection string del Storage Account — activa autenticación por clave |
+| `AZURE_STORAGE_ACCOUNT_NAME` | Script (nombre del Storage Account) | Activa `AzureTableCredentialStore` |
 | `ISSUER_BASE_URL` | Script (FQDN de Container Apps) | URL pública del emisor para el DID Document |
 | `H2_CONSOLE_ENABLED` | Script (`false`) | Desactiva la consola H2 en producción |
+
+### Estrategia de autenticación en Table Storage
+
+`AzureTableCredentialStore` usa connection string en prioridad sobre Managed Identity:
+```
+AZURE_STORAGE_CONNECTION_STRING presente → autenticación por account key (más compatible)
+AZURE_STORAGE_CONNECTION_STRING ausente  → DefaultAzureCredential (Managed Identity)
+```
+
+La connection string se genera en el deploy script, se almacena en Key Vault como secret `storage-connection-string`, y se inyecta vía `secretref:` al contenedor. La clave nunca aparece en código ni en variables directas del Container App.
+
+> Las variables `SPRING_DATASOURCE_*`, `SPRING_DATASOURCE_DRIVER` y `JPA_DIALECT` ya no se usan en producción — la persistencia la gestiona `AzureTableCredentialStore` directamente.
 
 ---
 
@@ -210,16 +248,12 @@ Con `min-replicas: 0`, cuando no hay tráfico no hay cómputo activo.
 | Recurso | SKU | Costo estimado/mes |
 |---------|-----|-------------------|
 | Container Apps | Consumption (escala a 0) | ~$0–5 en uso bajo |
-| PostgreSQL | Burstable B1ms | ~$15–20 |
+| Azure Table Storage | Standard LRS | ~$0 para un demo (<1 GB) |
 | Key Vault | Standard | ~$0.03 por 10k operaciones |
 | Container Registry | Basic | ~$5 |
-| **Total** | | **~$20–30/mes en uso bajo** |
+| **Total** | | **~$5–10/mes en uso bajo** |
 
-Para entornos de desarrollo o prueba donde PostgreSQL no está siempre activo, considerar detenerlo manualmente:
-```bash
-az postgres flexible-server stop -g $RESOURCE_GROUP -n $PG_SERVER
-az postgres flexible-server start -g $RESOURCE_GROUP -n $PG_SERVER
-```
+Comparado con la arquitectura anterior (con PostgreSQL Flexible Server ~$15–20/mes), el ahorro es de **~$15/mes**.
 
 ---
 
@@ -231,7 +265,7 @@ az group delete -n $RESOURCE_GROUP --yes --no-wait
 rm -f .azure-suffix .azure-deploy-output.env
 ```
 
-Esto elimina **todos** los recursos del Resource Group incluyendo la clave privada del emisor y la base de datos.
+Esto elimina **todos** los recursos del Resource Group incluyendo la clave privada del emisor y los datos de Table Storage.
 
 ---
 
@@ -239,10 +273,12 @@ Esto elimina **todos** los recursos del Resource Group incluyendo la clave priva
 
 | Aspecto | Local (dev) | Azure (producción) |
 |---------|-------------|-------------------|
-| Base de datos | H2 embebida (archivo) | PostgreSQL gestionado |
+| Persistencia de VCs | H2 embebida vía JPA (`JpaCredentialStore`) | Azure Table Storage (`AzureTableCredentialStore`) |
+| Activación del store | `AZURE_STORAGE_ACCOUNT_NAME` ausente/vacío | `AZURE_STORAGE_ACCOUNT_NAME=didissuer<suffix>` |
+| Autenticación al store | N/A (H2 embebida) | Managed Identity (sin contraseña) |
 | Clave del emisor | Archivo `./data/issuer_key.pem` | Key Vault secret (base64) |
 | Escalado | 1 instancia fija | 0–3 réplicas automático |
-| Consola H2 | Disponible en `/h2-console` | Desactivada |
+| Consola H2 | Disponible en `/h2-console` | Desactivada (`H2_CONSOLE_ENABLED=false`) |
 | URL del emisor | `http://localhost:8080` | `https://<fqdn>.azurecontainerapps.io` |
 
 El código no cambia entre entornos — todo se controla por variables de entorno.

@@ -104,6 +104,115 @@ Cada solicitud de credencial requiere un nonce fresco del issuer. El nonce se co
 
 ---
 
+## Cómo funciona el Proof JWT
+
+El Proof JWT demuestra que el holder **posee la clave privada** correspondiente a su DID, sin revelarla. Es el mecanismo central de autenticación del protocolo.
+
+### Paso 1 — Generar el par de claves y el DID (una sola vez)
+
+```
+clave privada (secp256k1, 32 bytes)
+        │
+        ▼
+clave pública comprimida (33 bytes)
+        │
+        ▼
+multicodec prefix [0xe7, 0x01] + pub_bytes
+        │
+        ▼
+base58btc encode → z<encoded>
+        │
+        ▼
+DID = "did:key:z<encoded>"
+```
+
+El DID **es** la clave pública codificada. No se registra en ningún servidor — se resuelve localmente. Quien recibe el DID puede derivar la clave pública y verificar firmas sin contactar al issuer.
+
+### Paso 2 — Pedir el nonce (usando el DID)
+
+```
+GET /credentials/nonce?holder_did=did:key:z...
+→ { "nonce": "abc123" }
+```
+
+El nonce es de un solo uso y tiene expiración de 5 minutos. Protege contra replay attacks: si alguien intercepta el Proof JWT, no puede reutilizarlo porque el nonce ya fue consumido.
+
+### Paso 3 — Firmar el Proof JWT (con la clave privada)
+
+```
+header  = { alg: ES256K, typ: openid4vci-proof+jwt, kid: "did:key:z...#z..." }
+payload = {
+    iss:             "did:key:z..."     ← quién firma
+    aud:             "https://issuer"   ← a quién va dirigido
+    nonce:           "abc123"           ← el nonce recibido
+    credential_type: "UniversityDegreeCredential"
+    subject_claims:  { givenName, familyName, email }
+}
+firma = ECDSA(SHA256(header.payload), clave_privada)
+```
+
+La firma cubre el `nonce` — si alguien modifica el nonce, la firma es inválida.
+
+### Paso 4 — El backend verifica sin conocer la clave privada
+
+```
+1. Extrae el DID del campo iss
+2. Deriva la clave pública del DID (es pública, está en el DID)
+3. Verifica la firma ECDSA con esa clave pública
+4. Verifica que el nonce coincida y no haya sido usado antes
+5. Si todo ok → emite la VC firmada por el issuer
+```
+
+La clave privada **nunca sale del dispositivo**. El backend solo necesita la clave pública (obtenida del DID) para verificar.
+
+### Flujo completo
+
+```
+App Android / Postman                  Issuer Backend
+─────────────────────                  ──────────────────────────────
+1. ./scripts/gen-holder.sh
+   → genera clave privada + pública
+   → deriva DID del holder
+   → guarda en .holder-keys
+
+2. GET /nonce?holder_did=did:key:z... ─────────────────────────────▶
+                                       guarda nonce para ese DID
+   ◀─ { nonce: "abc123" } ────────────────────────────────────────
+
+3. ./scripts/gen-proof.sh <nonce>
+   → lee clave privada de .holder-keys
+   → firma JWT con nonce + subject_claims
+   → imprime PROOF_JWT
+
+4. POST /credentials/issue ────────────────────────────────────────▶
+   { holder_did, proof: PROOF_JWT }
+                                       verifica firma (clave pública del DID)
+                                       verifica nonce (consumido, one-time)
+                                       emite VC JWT firmada por el issuer
+   ◀─ { credential: "eyJ..." } ───────────────────────────────────
+```
+
+### Para pruebas con Postman
+
+```bash
+# Paso 1 — generar identidad del holder (una sola vez)
+./scripts/gen-holder.sh
+# → imprime HOLDER_DID, guarda .holder-keys
+# → copiar HOLDER_DID a la variable HOLDER_DID de la colección
+
+# Paso 2 — obtener nonce (ejecutar "GET Nonce" en Postman)
+# → NONCE se guarda automáticamente en la variable de colección
+
+# Paso 3 — generar proof con el nonce
+./scripts/gen-proof.sh <NONCE>
+# → imprime PROOF_JWT
+# → copiar a la variable PROOF_JWT de la colección
+
+# Paso 4 — ejecutar "POST Issue VC" en Postman
+```
+
+---
+
 ## Formato de los mensajes
 
 ### Proof JWT — del holder al issuer

@@ -2,7 +2,7 @@ package com.did.issuer.service;
 
 import com.did.issuer.config.IssuerKeyConfig.IssuerKeys;
 import com.did.issuer.model.CredentialRecord;
-import com.did.issuer.repository.CredentialRepository;
+import com.did.issuer.store.CredentialStore;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -36,16 +36,16 @@ public class CredentialIssuerService {
 
     private static final Logger log = LoggerFactory.getLogger(CredentialIssuerService.class);
 
-    private final IssuerKeys          issuerKeys;
-    private final CredentialRepository repository;
-    private final ObjectMapper         mapper = new ObjectMapper();
+    private final IssuerKeys     issuerKeys;
+    private final CredentialStore store;
+    private final ObjectMapper    mapper = new ObjectMapper();
 
     @Value("${issuer.vc-ttl-seconds:86400}")
     private long vcTtlSeconds;
 
-    public CredentialIssuerService(IssuerKeys issuerKeys, CredentialRepository repository) {
-        this.issuerKeys  = issuerKeys;
-        this.repository  = repository;
+    public CredentialIssuerService(IssuerKeys issuerKeys, CredentialStore store) {
+        this.issuerKeys = issuerKeys;
+        this.store      = store;
     }
 
     /**
@@ -124,7 +124,7 @@ public class CredentialIssuerService {
         record.setVcJwtHash(vcJwtHash);
         record.setIssuedAt(Instant.ofEpochSecond(now));
         record.setExpiresAt(Instant.ofEpochSecond(now + vcTtlSeconds));
-        repository.save(record);
+        store.save(record);
 
         log.info("VC emitida: {} para {}", vcId, holderDid);
         return vcJwt;

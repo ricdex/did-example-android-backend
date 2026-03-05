@@ -85,7 +85,7 @@ do_request() {
 
   local tmp
   tmp=$(mktemp)
-  LAST_STATUS=$(curl "${curl_args[@]}" -o "$tmp" -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+  LAST_STATUS=$(curl "${curl_args[@]}" --max-time 30 -o "$tmp" -w "%{http_code}" "$url" 2>/dev/null || echo "000")
   LAST_BODY=$(cat "$tmp")
   rm -f "$tmp"
 }
@@ -246,16 +246,16 @@ PYEOF
 
 # ─── Esperar backend ──────────────────────────────────────────────────────────
 wait_for_backend() {
-  blue "Esperando al backend en $BASE_URL..."
-  for i in $(seq 1 20); do
-    if curl -sf "$BASE_URL/issuer/did" >/dev/null 2>&1; then
+  blue "Esperando al backend en $BASE_URL (cold start Java puede tardar ~60s)..."
+  for i in $(seq 1 40); do
+    if curl -sf --max-time 10 "$BASE_URL/issuer/did" >/dev/null 2>&1; then
       green "Backend disponible"
       return 0
     fi
-    sleep 2
-    echo -n "."
+    sleep 5
+    echo -n " $i"
   done
-  red "Backend no responde en $BASE_URL"
+  red "Backend no responde en $BASE_URL tras ~200s"
   exit 1
 }
 
@@ -474,6 +474,54 @@ assert_not_contains "Metadatos NO exponen el JWT completo"      "$VC_JWT"       
 assert_not_contains "Metadatos no tienen campo 'credential'"    '"credential":'   "$LAST_BODY"
 
 yellow "Metadatos: $(echo "$LAST_BODY" | jq -c '.[0]')"
+log_section_end
+echo ""
+
+# ─── Flujo 4: Revocación ─────────────────────────────────────────────────────
+blue "FLUJO 4 — Revocación de Verifiable Credential"
+divider
+report_section "Flujo 4 — Revocación de Verifiable Credential"
+
+# Extraer credentialId (claim jti) del VC JWT emitido en flujo 2
+CREDENTIAL_ID=$(python3 - "$VC_JWT" <<'PYEOF'
+import sys, json, base64
+jwt = sys.argv[1]
+part = jwt.split(".")[1]
+part += "=" * ((4 - len(part) % 4) % 4)
+payload = json.loads(base64.urlsafe_b64decode(part).decode("utf-8"))
+print(payload.get("jti", ""))
+PYEOF
+)
+yellow "Credential ID: $CREDENTIAL_ID"
+
+# 4a. POST /credentials/{credentialId}/revoke → 204
+# Los colones en urn:uuid:... son válidos en un path segment HTTP
+do_request "POST" "$BASE_URL/credentials/${CREDENTIAL_ID}/revoke"
+log_request "POST /credentials/{credentialId}/revoke" \
+  "POST" "$BASE_URL/credentials/${CREDENTIAL_ID}/revoke"
+
+assert_eq "POST /credentials/{id}/revoke → HTTP 204" "204" "$LAST_STATUS"
+log_section_end
+
+# 4b. GET /credentials → verificar revoked=true
+do_request "GET" "$BASE_URL/credentials?holder_did=$HOLDER_DID"
+log_request "GET /credentials?holder_did (verificar revoked=true)" \
+  "GET" "$BASE_URL/credentials?holder_did=$HOLDER_DID"
+
+assert_eq "GET /credentials?holder_did → HTTP 200" "200" "$LAST_STATUS"
+
+REVOKED_VAL=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; data=json.load(sys.stdin); print(data[0].get('revoked','')) if data else print('')" 2>/dev/null || echo "")
+assert_eq "Metadatos muestran revoked=true" "True" "$REVOKED_VAL"
+log_section_end
+
+# 4c. POST /credentials/{credentialId}/revoke para credencial inexistente → 404
+FAKE_ID="urn:uuid:00000000-0000-0000-0000-000000000000"
+do_request "POST" "$BASE_URL/credentials/${FAKE_ID}/revoke"
+log_request "POST /credentials/{fake-id}/revoke — credencial inexistente" \
+  "POST" "$BASE_URL/credentials/${FAKE_ID}/revoke"
+
+assert_eq "POST /credentials/{fake-id}/revoke → HTTP 404" "404" "$LAST_STATUS"
 log_section_end
 echo ""
 

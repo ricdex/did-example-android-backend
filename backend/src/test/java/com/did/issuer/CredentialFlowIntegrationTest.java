@@ -555,4 +555,80 @@ class CredentialFlowIntegrationTest {
 
         reportSectionEnd();
     }
+
+    // ─── Flujo 4: Revocación ─────────────────────────────────────────────────
+
+    @Test
+    @Order(8)
+    @DisplayName("POST /credentials/{credentialId}/revoke — revoca la VC emitida (204)")
+    void revokeCredential() throws Exception {
+        reportSection("Flujo 4 — Revocación de Verifiable Credential");
+
+        assertThat(vcJwt).as("El test de emisión (Order 4) debe ejecutarse primero").isNotNull();
+
+        // Extraer credentialId del claim 'jti' del VC JWT
+        String[] parts = vcJwt.split("\\.");
+        String vcPayloadJson = new String(DIDKeyUtil.b64urlDecode(parts[1]));
+        String credentialId = MAPPER.readTree(vcPayloadJson).get("jti").asText();
+        assertThat(credentialId).startsWith("urn:uuid:");
+        pass("credentialId extraído del JWT: " + credentialId);
+
+        // POST /credentials/{credentialId}/revoke
+        // Los colones en 'urn:uuid:...' son válidos en un path segment HTTP
+        String revokePath = "/credentials/" + credentialId + "/revoke";
+        ResponseEntity<Void> resp = rest.exchange(
+            revokePath, HttpMethod.POST, HttpEntity.EMPTY, Void.class);
+
+        logRequest("POST " + revokePath,
+                "POST", revokePath, null,
+                resp.getStatusCode().value(), Map.of());
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NO_CONTENT);
+        pass("HTTP 204 No Content (credencial revocada)");
+
+        reportSectionEnd();
+    }
+
+    @Test
+    @Order(9)
+    @DisplayName("GET /credentials?holder_did — metadatos muestran revoked=true tras revocación")
+    @SuppressWarnings("unchecked")
+    void metadataShowsRevoked() {
+        assertThat(holderDid).as("El test de emisión (Order 4) debe ejecutarse primero").isNotNull();
+
+        ResponseEntity<List<Map<String, Object>>> resp =
+            rest.exchange("/credentials?holder_did=" + holderDid, HttpMethod.GET, null,
+                new org.springframework.core.ParameterizedTypeReference<>() {});
+
+        logRequest("GET /credentials?holder_did — verificar revoked=true",
+                "GET", "/credentials?holder_did=" + holderDid, null,
+                resp.getStatusCode().value(), resp.getBody());
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
+        pass("HTTP 200 OK");
+
+        Map<String, Object> record = resp.getBody().get(0);
+        assertThat(record.get("revoked")).isEqualTo(true);
+        pass("Campo 'revoked' = true tras la revocación");
+
+        reportSectionEnd();
+    }
+
+    @Test
+    @Order(10)
+    @DisplayName("POST /credentials/{credentialId}/revoke — 404 para credencial inexistente")
+    void revokeNonExistentCredential() {
+        String fakePath = "/credentials/urn:uuid:00000000-0000-0000-0000-000000000000/revoke";
+        ResponseEntity<Void> resp = rest.exchange(
+            fakePath, HttpMethod.POST, HttpEntity.EMPTY, Void.class);
+
+        logRequest("POST " + fakePath + " — credencial inexistente",
+                "POST", fakePath, null,
+                resp.getStatusCode().value(), Map.of());
+
+        assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+        pass("HTTP 404 Not Found (credencial inexistente)");
+
+        reportSectionEnd();
+    }
 }

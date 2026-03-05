@@ -29,6 +29,10 @@ issuer:
   # Validez de los nonces (segundos)
   nonce-ttl-seconds: 300      # 5 minutos
 
+azure:
+  storage:
+    account-name: ${AZURE_STORAGE_ACCOUNT_NAME:}
+
 logging:
   level:
     com.did: DEBUG

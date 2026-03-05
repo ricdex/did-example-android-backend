@@ -59,11 +59,17 @@
             <artifactId>spring-boot-starter-validation</artifactId>
         </dependency>
 
-        <!-- PostgreSQL (producción) -->
+        <!-- Azure Table Storage -->
         <dependency>
-            <groupId>org.postgresql</groupId>
-            <artifactId>postgresql</artifactId>
-            <scope>runtime</scope>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-data-tables</artifactId>
+            <version>12.3.16</version>
+        </dependency>
+        <!-- Azure Identity (Managed Identity / DefaultAzureCredential) -->
+        <dependency>
+            <groupId>com.azure</groupId>
+            <artifactId>azure-identity</artifactId>
+            <version>1.13.3</version>
         </dependency>
 
         <!-- Tests -->
