@@ -114,7 +114,12 @@ az acr build \
   -f "$PROJECT_ROOT/docker/Dockerfile" \
   "$PROJECT_ROOT/backend" \
   --output none
-ok "Imagen lista: $ACR_SERVER/$IMAGE_TAG"
+# Obtener el digest de la imagen recién construida para forzar nueva revision en Container Apps.
+# Usar el tag :latest en el deploy haría que ACA no cree nueva revision si la spec no cambia.
+IMAGE_DIGEST=$(az acr repository show -n "$ACR_NAME" \
+  --image "$IMAGE_TAG" --query digest -o tsv 2>/dev/null)
+IMAGE_REF="${ACR_SERVER}/did-issuer@${IMAGE_DIGEST}"
+ok "Imagen lista: $IMAGE_REF"
 
 # ─── [4/11] Azure Key Vault ───────────────────────────────────────────────────
 step "[4/11] Azure Key Vault"
@@ -240,22 +245,24 @@ else
   skip "secret storage-connection-string"
 fi
 
-# Crear tabla credentials (idempotente con --auth-mode login)
-TABLE_EXISTS=$(az storage table exists \
-  --account-name "$STORAGE_ACCOUNT" \
-  --name credentials \
-  --auth-mode login \
-  --query exists -o tsv 2>/dev/null || echo "false")
-if [ "$TABLE_EXISTS" != "true" ]; then
-  az storage table create \
+# Crear tablas (idempotente con --auth-mode login)
+for TABLE_NAME in credentials holderDids; do
+  TABLE_EXISTS=$(az storage table exists \
     --account-name "$STORAGE_ACCOUNT" \
-    --name credentials \
+    --name "$TABLE_NAME" \
     --auth-mode login \
-    --output none
-  ok "Tabla 'credentials' creada"
-else
-  skip "tabla credentials"
-fi
+    --query exists -o tsv 2>/dev/null || echo "false")
+  if [ "$TABLE_EXISTS" != "true" ]; then
+    az storage table create \
+      --account-name "$STORAGE_ACCOUNT" \
+      --name "$TABLE_NAME" \
+      --auth-mode login \
+      --output none
+    ok "Tabla '$TABLE_NAME' creada"
+  else
+    skip "tabla $TABLE_NAME"
+  fi
+done
 
 # ─── [7/11] Managed Identity ─────────────────────────────────────────────────
 step "[7/11] User-Assigned Managed Identity"
@@ -348,7 +355,7 @@ if exists "az containerapp show -g '$RESOURCE_GROUP' -n '$ACA_NAME'"; then
   fi
   az containerapp update \
     -g "$RESOURCE_GROUP" -n "$ACA_NAME" \
-    --image "${ACR_SERVER}/${IMAGE_TAG}" \
+    --image "${IMAGE_REF}" \
     --set-env-vars \
       "AZURE_STORAGE_ACCOUNT_NAME=${STORAGE_ACCOUNT}" \
       "H2_CONSOLE_ENABLED=false" \
@@ -358,7 +365,7 @@ else
     -g "$RESOURCE_GROUP" \
     -n "$ACA_NAME" \
     --environment "$ACA_ENV" \
-    --image "${ACR_SERVER}/${IMAGE_TAG}" \
+    --image "${IMAGE_REF}" \
     --registry-server "$ACR_SERVER" \
     --registry-username "$ACR_NAME" \
     --registry-password "$ACR_PASSWORD" \
@@ -480,186 +487,28 @@ ISSUER_PUBLIC_KEY_HEX=$ISSUER_PUB_HEX
 #   6. Ejecutar "POST Revoke VC"        → revoca la VC
 EOF
 
-# ─── postman-collection.json ──────────────────────────────────────────────────
+# ─── postman-collection.json — actualizar solo BASE_URL e ISSUER_DID ──────────
+# No se regenera el archivo completo para preservar todas las carpetas y requests.
 python3 - "$APP_URL" "$ISSUER_DID" "$PROJECT_ROOT/postman-collection.json" <<'PYEOF'
-import sys, json, uuid
+import sys, json
 
 BASE_URL   = sys.argv[1]
 ISSUER_DID = sys.argv[2]
+path       = sys.argv[3]
 
-HOLDER_DID_DUMMY = "did:key:zQ3shTestHolder000000000000"
+with open(path) as f:
+    col = json.load(f)
 
-def req(name, method, path, description, body=None, pre_script=None, test_script=None, params=None):
-    url_parts = {"raw": BASE_URL + path, "host": [BASE_URL], "path": path.lstrip("/").split("/")}
-    if params:
-        url_parts["query"] = [{"key": k, "value": v} for k, v in params.items()]
-    r = {
-        "name": name,
-        "request": {
-            "method": method,
-            "header": [{"key": "Content-Type", "value": "application/json"}] if body else [],
-            "url": url_parts,
-            "description": description,
-        },
-        "response": []
-    }
-    if body:
-        r["request"]["body"] = {"mode": "raw", "raw": json.dumps(body, indent=2), "options": {"raw": {"language": "json"}}}
-    if pre_script:
-        r["event"] = r.get("event", [])
-        r["event"].append({"listen": "prerequest", "script": {"type": "text/javascript", "exec": pre_script.splitlines()}})
-    if test_script:
-        r["event"] = r.get("event", [])
-        r["event"].append({"listen": "test", "script": {"type": "text/javascript", "exec": test_script.splitlines()}})
-    return r
+for v in col.get("variable", []):
+    if v["key"] == "BASE_URL":
+        v["value"] = BASE_URL
+    elif v["key"] == "ISSUER_DID":
+        v["value"] = ISSUER_DID
 
-nonce_pre = """\
-// Obtener nonce fresco antes de emitir la VC
-pm.sendRequest({
-    url: pm.collectionVariables.get('BASE_URL') + '/credentials/nonce?holder_did=' + pm.collectionVariables.get('HOLDER_DID'),
-    method: 'GET'
-}, function(err, res) {
-    if (!err && res.code === 200) {
-        var nonce = res.json().nonce;
-        pm.collectionVariables.set('NONCE', nonce);
-        console.log('✓ Nonce obtenido: ' + nonce);
-        console.log('');
-        console.log('⚠  Genera el PROOF_JWT antes de enviar:');
-        console.log('   ./scripts/gen-proof.sh ' + nonce + ' ' + pm.collectionVariables.get('HOLDER_DID'));
-        console.log('   Luego pega el resultado en la variable PROOF_JWT.');
-    } else {
-        console.error('Error obteniendo nonce: ' + (err || res.status));
-    }
-});"""
-
-nonce_test = """\
-pm.test("Status 200", () => pm.response.to.have.status(200));
-pm.test("Contiene nonce", () => pm.expect(pm.response.json()).to.have.property('nonce'));
-var nonce = pm.response.json().nonce;
-pm.collectionVariables.set('NONCE', nonce);
-console.log('Nonce guardado: ' + nonce);"""
-
-issue_test = """\
-pm.test("Status 200 - VC emitida", () => pm.response.to.have.status(200));
-if (pm.response.code === 200) {
-    var json = pm.response.json();
-    pm.test("Contiene credentialId", () => pm.expect(json).to.have.property('credentialId'));
-    pm.test("Contiene credential JWT", () => pm.expect(json).to.have.property('credential'));
-    pm.collectionVariables.set('CREDENTIAL_ID', json.credentialId || '');
-    console.log('✓ CREDENTIAL_ID guardado: ' + json.credentialId);
-}"""
-
-creds_test = """\
-pm.test("Status 200", () => pm.response.to.have.status(200));
-if (pm.response.code === 200) {
-    var list = pm.response.json();
-    pm.test("Es un array", () => pm.expect(list).to.be.an('array'));
-    if (list.length > 0) {
-        pm.test("Tiene credential_id", () => pm.expect(list[0]).to.have.property('credential_id'));
-        pm.test("Tiene revoked", () => pm.expect(list[0]).to.have.property('revoked'));
-        pm.collectionVariables.set('CREDENTIAL_ID', list[0].credential_id || pm.collectionVariables.get('CREDENTIAL_ID'));
-        console.log('Credenciales encontradas: ' + list.length);
-        console.log('Primera: ' + JSON.stringify(list[0], null, 2));
-    }
-}"""
-
-revoke_test = """\
-pm.test("204 No Content (revocada correctamente)", () => pm.response.to.have.status(204));
-if (pm.response.code === 204) { console.log('✓ Credencial revocada: ' + pm.collectionVariables.get('CREDENTIAL_ID')); }
-if (pm.response.code === 404) { console.log('⚠  Credencial no encontrada. Verifica CREDENTIAL_ID.'); }"""
-
-did_test = """\
-pm.test("Status 200", () => pm.response.to.have.status(200));
-var json = pm.response.json();
-pm.test("Contiene did", () => pm.expect(json).to.have.property('did'));
-pm.test("DID comienza con did:key:", () => pm.expect(json.did).to.match(/^did:key:/));
-pm.collectionVariables.set('ISSUER_DID', json.did);
-console.log('Issuer DID: ' + json.did);"""
-
-collection = {
-    "info": {
-        "_postman_id": str(uuid.uuid4()),
-        "name": "DID Issuer API",
-        "description": (
-            "Colección generada automáticamente por deploy-azure.sh\n\n"
-            "**Flujo completo:**\n"
-            "1. GET Issuer DID → confirma backend activo\n"
-            "2. GET Nonce → obtiene nonce (guardado en {{NONCE}})\n"
-            "3. Generar PROOF_JWT externamente (ver gen-proof.sh)\n"
-            "4. POST Issue VC → emite la VC ({{CREDENTIAL_ID}} se guarda automático)\n"
-            "5. GET Credentials → lista VCs del holder\n"
-            "6. POST Revoke VC → revoca la VC\n\n"
-            "**Para generar PROOF_JWT:**\n"
-            "```\n./scripts/gen-proof.sh {{NONCE}} {{HOLDER_DID}}\n```\n"
-            "Pega el resultado en la variable PROOF_JWT de la colección."
-        ),
-        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-    },
-    "variable": [
-        {"key": "BASE_URL",       "value": BASE_URL,        "type": "string"},
-        {"key": "ISSUER_DID",     "value": ISSUER_DID,      "type": "string"},
-        {"key": "HOLDER_DID",     "value": HOLDER_DID_DUMMY,"type": "string", "description": "DID del holder — reemplazar con el DID real de la app Android"},
-        {"key": "NONCE",          "value": "",              "type": "string", "description": "Se rellena automáticamente al ejecutar GET Nonce"},
-        {"key": "CREDENTIAL_ID",  "value": "",              "type": "string", "description": "Se rellena automáticamente al ejecutar POST Issue VC"},
-        {"key": "PROOF_JWT",      "value": "PENDING_GENERATION", "type": "string", "description": "JWT firmado por el holder — generar con gen-proof.sh o la app Android"},
-    ],
-    "item": [
-        {
-            "name": "🔑 Identidad del Issuer",
-            "item": [
-                req("GET Issuer DID", "GET", "/issuer/did",
-                    "Retorna el DID del emisor y su clave pública secp256k1 comprimida.",
-                    test_script=did_test),
-                req("GET DID Document (W3C)", "GET", "/issuer/did-document",
-                    "Retorna el DID Document completo en formato W3C con el método de verificación.",
-                    test_script="""\
-pm.test("Status 200", () => pm.response.to.have.status(200));
-var json = pm.response.json();
-pm.test("Tiene @context", () => pm.expect(json).to.have.property('@context'));
-pm.test("Tiene verificationMethod", () => pm.expect(json).to.have.property('verificationMethod'));
-pm.test("Tiene EcdsaSecp256k1", () => pm.expect(JSON.stringify(json)).to.include('EcdsaSecp256k1'));"""),
-            ]
-        },
-        {
-            "name": "📋 Flujo de Credencial",
-            "item": [
-                req("GET Nonce", "GET", "/credentials/nonce",
-                    "Obtiene un nonce de un solo uso. El holder lo incluye en su Proof JWT firmado.\n\nEl nonce se guarda automáticamente en {{NONCE}}.",
-                    params={"holder_did": "{{HOLDER_DID}}"},
-                    test_script=nonce_test),
-                req("POST Issue VC", "POST", "/credentials/issue",
-                    (
-                        "Emite una Verifiable Credential firmada por el issuer.\n\n"
-                        "**Prerrequisito**: Generar {{PROOF_JWT}} con:\n"
-                        "```\n./scripts/gen-proof.sh {{NONCE}} {{HOLDER_DID}}\n```\n"
-                        "El pre-request script obtiene el nonce automáticamente y muestra el comando en la consola.\n\n"
-                        "El campo `proof` es un JWT firmado con la clave secp256k1 del holder que contiene:\n"
-                        "- `sub`: holder_did\n- `nonce`: el nonce obtenido\n- `aud`: DID del issuer\n\n"
-                        "{{CREDENTIAL_ID}} se guarda automáticamente en la respuesta."
-                    ),
-                    body={
-                        "holderDid": "{{HOLDER_DID}}",
-                        "proof": "{{PROOF_JWT}}",
-                        "credentialType": "UniversityDegreeCredential"
-                    },
-                    pre_script=nonce_pre,
-                    test_script=issue_test),
-                req("GET Credentials by Holder", "GET", "/credentials",
-                    "Lista los metadatos de todas las VCs emitidas para un holder.\n\nNo expone el JWT completo, solo metadatos (credential_id, type, issued_at, expires_at, revoked).",
-                    params={"holder_did": "{{HOLDER_DID}}"},
-                    test_script=creds_test),
-                req("POST Revoke VC", "POST", "/credentials/{{CREDENTIAL_ID}}/revoke",
-                    "Revoca una VC por su ID.\n\n- `204 No Content` → revocada correctamente\n- `404 Not Found` → la credencial no existe\n\n{{CREDENTIAL_ID}} se rellena automáticamente después de POST Issue VC.",
-                    test_script=revoke_test),
-            ]
-        }
-    ]
-}
-
-with open(sys.argv[3], "w") as f:
-    json.dump(collection, f, indent=2, ensure_ascii=False)
+with open(path, "w") as f:
+    json.dump(col, f, indent=2, ensure_ascii=False)
 PYEOF
-ok "Colección Postman generada: postman-collection.json"
+ok "Colección Postman actualizada: BASE_URL=$APP_URL"
 
 # ─── Resumen final ────────────────────────────────────────────────────────────
 echo ""

@@ -67,6 +67,7 @@ Con AZURE_STORAGE_ACCOUNT_NAME=didissuerabc (Azure Container Apps)
                     │   Azure Key Vault  │   │  Azure Table Storage │
                     │                   │   │                      │
                     │  issuer-key-pem   │   │  tabla: credentials  │
+                    │  storage-conn     │   │  tabla: holderDids   │
                     └───────────────────┘   └─────────────────────┘
 
                     ┌───────────────────┐
@@ -171,10 +172,20 @@ Ejemplo del bloque de endpoints que aparece en pantalla:
 │  Base URL:                                              │
 │  https://did-issuer-app.azurecontainerapps.io           │
 │                                                         │
+│  — Registro de DID ──────────────────────────────────  │
+│  POST /dids/register               (registrar DID)     │
+│  GET  /dids/{did}                  (estado del DID)    │
+│  POST /dids/{did}/invalidate       (invalidar DID)     │
+│  GET  /clients/{clientId}/dids     (DIDs del cliente)  │
+│                                                         │
+│  — Credenciales ─────────────────────────────────────  │
 │  GET  /credentials/nonce           (paso 1, pedir VC)  │
 │  POST /credentials/issue           (paso 2, emitir VC) │
+│  POST /credentials/verify          (verificar VP JWT)  │
 │  GET  /credentials?holder_did=     (metadatos)         │
 │  POST /credentials/{id}/revoke     (revocar VC)        │
+│                                                         │
+│  — Identidad del issuer ─────────────────────────────  │
 │  GET  /issuer/did                  (info del emisor)   │
 │  GET  /issuer/did-document         (DID Document W3C)  │
 │                                                         │

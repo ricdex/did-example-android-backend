@@ -2,9 +2,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # test-integration.sh — Pruebas de integración end-to-end via curl
 #
-# Replica los tres flujos DID contra el backend en ejecución.
-# Genera un reporte Markdown con cada request y response.
-# Requiere: curl, jq, python3, pip3
+# Flujos cubiertos:
+#   0. Registro y verificación de DID del holder
+#   1. Identidad del Issuer
+#   2. Obtención de Verifiable Credential
+#   2b. Seguridad: anti-replay
+#   3. Metadatos del Holder
+#   4. Revocación de VC
+#   5. Invalidación de DID
+#   6. Verificación de VP (válida, con VC revocada, sin vp_jwt)
 #
 # Uso:
 #   ./scripts/test-integration.sh               # apunta a localhost:8080
@@ -22,7 +28,6 @@ REPORT_DIR="$(cd "$(dirname "$0")/.." && pwd)/reports"
 mkdir -p "$REPORT_DIR"
 REPORT_FILE="$REPORT_DIR/test-report-curl-${TIMESTAMP}.md"
 
-# Estado interno de do_request
 LAST_STATUS=""
 LAST_BODY=""
 
@@ -75,8 +80,6 @@ assert_not_contains() {
 }
 
 # ─── HTTP helper ──────────────────────────────────────────────────────────────
-# do_request METHOD URL [CONTENT_TYPE] [BODY]
-# Resultado en LAST_STATUS (código HTTP) y LAST_BODY (cuerpo de respuesta)
 do_request() {
   local method="$1" url="$2" content_type="${3:-}" body="${4:-}"
   local curl_args=(-s -X "$method")
@@ -96,7 +99,6 @@ pretty_json() {
     || echo "$1"
 }
 
-# Decodifica header y payload de un JWT para mostrarlo legible
 decode_jwt_display() {
   local jwt="$1"
   python3 - "$jwt" <<'PYEOF'
@@ -126,13 +128,10 @@ report_section() {
   printf '\n## %s\n\n' "$1" >> "$REPORT_FILE"
 }
 
-# log_request TITLE METHOD URL [REQ_DISPLAY]
-# Usa LAST_STATUS y LAST_BODY para la respuesta
 log_request() {
   local title="$1" method="$2" url="$3" req_display="${4:-}"
   local pretty_resp
   pretty_resp=$(pretty_json "$LAST_BODY")
-
   {
     printf '### %s\n\n' "$title"
     printf '**Request**\n\n```\n%s %s\n' "$method" "$url"
@@ -160,16 +159,62 @@ check_deps() {
   }
 }
 
-# ─── Generador de Proof JWT (Python) ─────────────────────────────────────────
-generate_proof() {
-  local nonce="$1" issuer_url="$2" credential_type="${3:-VerifiableCredential}"
-
-  python3 - "$nonce" "$issuer_url" "$credential_type" <<'PYEOF'
-import sys, json, base64, hashlib, time
+# ─── Generador de claves del holder ──────────────────────────────────────────
+# Genera un par de claves secp256k1 y devuelve did, public_key_hex, private_key_hex
+generate_holder_keys() {
+  python3 <<'PYEOF'
+import json, base64
 
 try:
     from cryptography.hazmat.primitives.asymmetric.ec import (
-        generate_private_key, SECP256K1, ECDSA)
+        generate_private_key, SECP256K1)
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat)
+except ImportError:
+    print(json.dumps({"error": "pip install cryptography"}))
+    import sys; sys.exit(1)
+
+ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58encode(data):
+    n = int.from_bytes(data, "big")
+    result = []
+    while n > 0:
+        n, r = divmod(n, 58)
+        result.append(ALPHABET[r:r+1])
+    leading = len(data) - len(data.lstrip(b"\x00"))
+    return (ALPHABET[0:1] * leading + b"".join(reversed(result))).decode()
+
+priv_key  = generate_private_key(SECP256K1(), default_backend())
+pub_key   = priv_key.public_key()
+pub_bytes = pub_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+
+multicodec = bytes([0xe7, 0x01]) + pub_bytes
+encoded    = "z" + b58encode(multicodec)
+did        = "did:key:" + encoded
+
+priv_int = priv_key.private_numbers().private_value
+priv_hex = priv_int.to_bytes(32, "big").hex()
+
+print(json.dumps({
+    "did":             did,
+    "public_key_hex":  pub_bytes.hex(),
+    "private_key_hex": priv_hex
+}))
+PYEOF
+}
+
+# ─── Generador de Proof JWT con clave existente ───────────────────────────────
+# sign_proof PRIVATE_KEY_HEX NONCE ISSUER_URL [CREDENTIAL_TYPE]
+sign_proof() {
+  local priv_hex="$1" nonce="$2" issuer_url="$3" credential_type="${4:-VerifiableCredential}"
+
+  python3 - "$priv_hex" "$nonce" "$issuer_url" "$credential_type" <<'PYEOF'
+import sys, json, base64, time
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ec import (
+        derive_private_key, SECP256K1, ECDSA)
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.backends import default_backend
     from cryptography.hazmat.primitives.serialization import (
@@ -180,12 +225,13 @@ except ImportError:
     print(json.dumps({"error": "pip install cryptography"}))
     sys.exit(1)
 
-nonce           = sys.argv[1]
-issuer_url      = sys.argv[2]
-credential_type = sys.argv[3]
+priv_hex        = sys.argv[1]
+nonce           = sys.argv[2]
+issuer_url      = sys.argv[3]
+credential_type = sys.argv[4]
 
 ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-def b58encode(data: bytes) -> str:
+def b58encode(data):
     n = int.from_bytes(data, "big")
     result = []
     while n > 0:
@@ -199,7 +245,8 @@ def b64url(data):
         data = data.encode()
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
-priv_key = generate_private_key(SECP256K1(), default_backend())
+priv_int = int.from_bytes(bytes.fromhex(priv_hex), "big")
+priv_key = derive_private_key(priv_int, SECP256K1(), default_backend())
 pub_key  = priv_key.public_key()
 pub_bytes = pub_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
 
@@ -231,16 +278,12 @@ payload_json = json.dumps({
 }, separators=(",", ":"))
 
 signing_input = b64url(header_json) + "." + b64url(payload_json)
-der_sig = priv_key.sign(signing_input.encode(), ECDSA(hashes.SHA256()))
-r, s    = decode_dss_signature(der_sig)
+der_sig  = priv_key.sign(signing_input.encode(), ECDSA(hashes.SHA256()))
+r, s     = decode_dss_signature(der_sig)
 sig_bytes = r.to_bytes(32, "big") + s.to_bytes(32, "big")
 jwt       = signing_input + "." + b64url(sig_bytes)
 
-print(json.dumps({
-    "did":            did,
-    "public_key_hex": pub_bytes.hex(),
-    "proof_jwt":      jwt
-}))
+print(jwt)
 PYEOF
 }
 
@@ -265,7 +308,6 @@ wait_for_backend() {
 
 check_deps
 
-# Cabecera del reporte
 cat > "$REPORT_FILE" <<HEADER
 # Reporte de pruebas de integración (curl)
 
@@ -285,36 +327,113 @@ echo ""
 wait_for_backend
 echo ""
 
+# ─── Generar claves del holder (una sola vez para todos los flujos) ────────────
+yellow "Generando par de claves secp256k1 para el holder de prueba..."
+HOLDER_KEYS=$(generate_holder_keys)
+HOLDER_DID=$(echo "$HOLDER_KEYS"  | jq -r '.did')
+HOLDER_PRIV=$(echo "$HOLDER_KEYS" | jq -r '.private_key_hex')
+yellow "Holder DID: $HOLDER_DID"
+echo ""
+
+# Generar un segundo holder para el flujo de invalidación
+HOLDER2_KEYS=$(generate_holder_keys)
+HOLDER2_DID=$(echo "$HOLDER2_KEYS"  | jq -r '.did')
+HOLDER2_PRIV=$(echo "$HOLDER2_KEYS" | jq -r '.private_key_hex')
+yellow "Holder2 DID (para prueba de invalidación): $HOLDER2_DID"
+echo ""
+
+# ─── Flujo 0: Registro de DID del Holder ─────────────────────────────────────
+blue "FLUJO 0 — Registro de DID del Holder"
+divider
+report_section "Flujo 0 — Registro de DID del Holder"
+
+CLIENT_ID="test-client@example.com"
+
+# 0a. POST /dids/register — registrar holder principal
+REGISTER_BODY="{\"client_id\":\"$CLIENT_ID\",\"did\":\"$HOLDER_DID\"}"
+do_request "POST" "$BASE_URL/dids/register" "application/json" "$REGISTER_BODY"
+log_request "POST /dids/register" "POST" "$BASE_URL/dids/register" \
+  "$(pretty_json "$REGISTER_BODY")"
+
+assert_eq       "POST /dids/register → HTTP 200"            "200"           "$LAST_STATUS"
+assert_contains "Respuesta contiene 'did'"                  '"did"'         "$LAST_BODY"
+assert_contains "Respuesta contiene 'client_id'"            '"client_id"'   "$LAST_BODY"
+assert_contains "Respuesta contiene 'active'"               '"active"'      "$LAST_BODY"
+assert_contains "DID registrado coincide"                   "$HOLDER_DID"   "$LAST_BODY"
+assert_contains "client_id coincide"                        "$CLIENT_ID"    "$LAST_BODY"
+
+ACTIVE_VAL=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('active',''))" 2>/dev/null || echo "")
+assert_eq "DID registrado como activo" "True" "$ACTIVE_VAL"
+log_section_end
+
+# 0b. POST /dids/register — idempotente (mismo DID dos veces → 200)
+do_request "POST" "$BASE_URL/dids/register" "application/json" "$REGISTER_BODY"
+log_request "POST /dids/register — idempotente" "POST" "$BASE_URL/dids/register" \
+  "$(pretty_json "$REGISTER_BODY")"
+assert_eq "Registro idempotente → HTTP 200" "200" "$LAST_STATUS"
+log_section_end
+
+# 0c. GET /dids/{did} — verificar estado activo
+do_request "GET" "$BASE_URL/dids/$HOLDER_DID"
+log_request "GET /dids/{did}" "GET" "$BASE_URL/dids/$HOLDER_DID"
+
+assert_eq       "GET /dids/{did} → HTTP 200"                "200"    "$LAST_STATUS"
+assert_contains "Estado contiene 'active'"                  '"active"' "$LAST_BODY"
+ACTIVE_DID_VAL=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('active',''))" 2>/dev/null || echo "")
+assert_eq "DID está activo" "True" "$ACTIVE_DID_VAL"
+log_section_end
+
+# 0d. GET /clients/{clientId}/dids — listar DIDs del cliente
+do_request "GET" "$BASE_URL/clients/$CLIENT_ID/dids"
+log_request "GET /clients/{clientId}/dids" "GET" "$BASE_URL/clients/$CLIENT_ID/dids"
+
+assert_eq       "GET /clients/{clientId}/dids → HTTP 200"   "200"           "$LAST_STATUS"
+assert_contains "Lista contiene nuestro DID"                "$HOLDER_DID"   "$LAST_BODY"
+log_section_end
+
+# 0e. POST /dids/register — DID no registrado sin method did:key → 400
+do_request "POST" "$BASE_URL/dids/register" "application/json" \
+  "{\"client_id\":\"$CLIENT_ID\",\"did\":\"did:web:example.com\"}"
+assert_eq "DID con método no soportado → HTTP 400" "400" "$LAST_STATUS"
+log_section_end
+
+# 0f. Registrar holder2 (para flujo 5)
+REGISTER2_BODY="{\"client_id\":\"$CLIENT_ID\",\"did\":\"$HOLDER2_DID\"}"
+do_request "POST" "$BASE_URL/dids/register" "application/json" "$REGISTER2_BODY"
+assert_eq "Registrar holder2 → HTTP 200" "200" "$LAST_STATUS"
+log_section_end
+echo ""
+
 # ─── Flujo 1: Identidad del Issuer ───────────────────────────────────────────
 blue "FLUJO 1 — Identidad del Issuer"
 divider
 report_section "Flujo 1 — Identidad del Issuer"
 
-# 1a. GET /issuer/did
 do_request "GET" "$BASE_URL/issuer/did"
 log_request "GET /issuer/did" "GET" "$BASE_URL/issuer/did"
 
-assert_eq      "GET /issuer/did → HTTP 200"                "200"             "$LAST_STATUS"
-assert_contains "Respuesta contiene 'did'"                 '"did"'           "$LAST_BODY"
-assert_contains "Respuesta contiene 'public_key_hex'"      '"public_key_hex"' "$LAST_BODY"
+assert_eq       "GET /issuer/did → HTTP 200"                       "200"              "$LAST_STATUS"
+assert_contains "Respuesta contiene 'did'"                         '"did"'            "$LAST_BODY"
+assert_contains "Respuesta contiene 'public_key_hex'"              '"public_key_hex"' "$LAST_BODY"
 
 ISSUER_DID=$(echo "$LAST_BODY" | jq -r '.did')
-assert_contains "DID comienza con did:key:z"               "did:key:z"       "$ISSUER_DID"
+assert_contains "DID comienza con did:key:z"                       "did:key:z"        "$ISSUER_DID"
 
 PUB_HEX=$(echo "$LAST_BODY" | jq -r '.public_key_hex')
-assert_eq       "Clave pública = 66 hex chars (33 bytes comprimidos)" "66"   "${#PUB_HEX}"
+assert_eq       "Clave pública = 66 hex chars (33 bytes comprimidos)" "66"            "${#PUB_HEX}"
 
 yellow "Issuer DID: $ISSUER_DID"
 log_section_end
 
-# 1b. GET /issuer/did-document
 do_request "GET" "$BASE_URL/issuer/did-document"
 log_request "GET /issuer/did-document" "GET" "$BASE_URL/issuer/did-document"
 
-assert_eq      "GET /issuer/did-document → HTTP 200"           "200"                  "$LAST_STATUS"
-assert_contains "DID Document contiene @context"               '@context'             "$LAST_BODY"
-assert_contains "DID Document contiene verificationMethod"     'verificationMethod'   "$LAST_BODY"
-assert_contains "DID Document contiene EcdsaSecp256k1"         'EcdsaSecp256k1'       "$LAST_BODY"
+assert_eq       "GET /issuer/did-document → HTTP 200"              "200"                 "$LAST_STATUS"
+assert_contains "DID Document contiene @context"                   '@context'            "$LAST_BODY"
+assert_contains "DID Document contiene verificationMethod"         'verificationMethod'  "$LAST_BODY"
+assert_contains "DID Document contiene EcdsaSecp256k1"             'EcdsaSecp256k1'      "$LAST_BODY"
 
 log_section_end
 echo ""
@@ -324,31 +443,32 @@ blue "FLUJO 2 — Obtención de Verifiable Credential"
 divider
 report_section "Flujo 2 — Obtención de Verifiable Credential"
 
-# 2a. GET /credentials/nonce
-do_request "GET" "$BASE_URL/credentials/nonce"
-log_request "GET /credentials/nonce" "GET" "$BASE_URL/credentials/nonce"
+# 2a. GET /credentials/nonce?holder_did=... (DID debe estar registrado y activo)
+do_request "GET" "$BASE_URL/credentials/nonce?holder_did=$HOLDER_DID"
+log_request "GET /credentials/nonce?holder_did" "GET" \
+  "$BASE_URL/credentials/nonce?holder_did=$HOLDER_DID"
 
-assert_eq      "GET /credentials/nonce → HTTP 200"  "200"    "$LAST_STATUS"
+assert_eq      "GET /credentials/nonce → HTTP 200"   "200"     "$LAST_STATUS"
 assert_contains "Respuesta contiene 'nonce'"         '"nonce"' "$LAST_BODY"
 
 NONCE=$(echo "$LAST_BODY" | jq -r '.nonce')
-assert_contains "Nonce no está vacío"                '.'      "$NONCE"
+assert_contains "Nonce no está vacío"                '.'       "$NONCE"
 yellow "Nonce obtenido: $NONCE"
 log_section_end
 
-# 2b. Generar par de claves + proof JWT firmado
-yellow "Generando par secp256k1 y firmando Proof JWT..."
-PROOF_DATA=$(generate_proof "$NONCE" "$BASE_URL" "UniversityDegreeCredential")
+# 2b. Nonce sin holder_did → 400
+do_request "GET" "$BASE_URL/credentials/nonce"
+assert_eq "GET /credentials/nonce sin holder_did → HTTP 400" "400" "$LAST_STATUS"
+log_section_end
 
-HOLDER_DID=$(echo "$PROOF_DATA" | jq -r '.did')
-PROOF_JWT=$(echo "$PROOF_DATA"  | jq -r '.proof_jwt')
-yellow "Holder DID: $HOLDER_DID"
+# 2c. Firmar Proof JWT con la clave del holder registrado
+yellow "Firmando Proof JWT con clave del holder registrado..."
+PROOF_JWT=$(sign_proof "$HOLDER_PRIV" "$NONCE" "$BASE_URL" "UniversityDegreeCredential")
 
-# 2c. POST /credentials/issue
+# 2d. POST /credentials/issue
 ISSUE_BODY="{\"holder_did\":\"$HOLDER_DID\",\"proof\":\"$PROOF_JWT\"}"
 do_request "POST" "$BASE_URL/credentials/issue" "application/json" "$ISSUE_BODY"
 
-# Construir display del request con proof JWT decodificado
 DECODED_PROOF=$(decode_jwt_display "$PROOF_JWT")
 ISSUE_DISPLAY=$(python3 - "$HOLDER_DID" "$DECODED_PROOF" <<'PYEOF'
 import sys, json
@@ -358,7 +478,6 @@ print(json.dumps({"holder_did": holder_did, "proof": decoded_proof}, indent=2, e
 PYEOF
 )
 
-# Construir display de la respuesta con VC JWT decodificada
 VC_RESP_DISPLAY="$LAST_BODY"
 if echo "$LAST_BODY" | jq -e '.credential' >/dev/null 2>&1; then
   VC_RAW=$(echo "$LAST_BODY" | jq -r '.credential')
@@ -382,14 +501,13 @@ fi
 ISSUE_STATUS="$LAST_STATUS"
 ISSUE_BODY_RESP="$LAST_BODY"
 
-assert_eq      "POST /credentials/issue → HTTP 200"                    "200"                        "$ISSUE_STATUS"
-assert_contains "Respuesta contiene 'credential'"                      '"credential"'               "$ISSUE_BODY_RESP"
+assert_eq      "POST /credentials/issue → HTTP 200"                      "200"                        "$ISSUE_STATUS"
+assert_contains "Respuesta contiene 'credential'"                        '"credential"'               "$ISSUE_BODY_RESP"
 
 VC_JWT=$(echo "$ISSUE_BODY_RESP" | jq -r '.credential // empty')
 VC_PARTS=$(echo "$VC_JWT" | tr '.' '\n' | wc -l | tr -d ' ')
-assert_eq      "VC JWT tiene 3 partes (header.payload.signature)"      "3"                          "$VC_PARTS"
+assert_eq      "VC JWT tiene 3 partes (header.payload.signature)"        "3"                          "$VC_PARTS"
 
-# Decodificar payload de la VC para validar su contenido
 VC_PAYLOAD=$(python3 - "$VC_JWT" <<'PYEOF'
 import sys, json, base64
 jwt = sys.argv[1]
@@ -398,11 +516,11 @@ part += "=" * ((4 - len(part) % 4) % 4)
 print(base64.urlsafe_b64decode(part).decode("utf-8"))
 PYEOF
 )
-assert_contains "VC contiene el DID del holder como 'sub'"             "$HOLDER_DID"                "$VC_PAYLOAD"
-assert_contains "VC contiene 'UniversityDegreeCredential'"             "UniversityDegreeCredential" "$VC_PAYLOAD"
-assert_contains "VC contiene 'iss' (DID del issuer)"                   '"iss"'                      "$VC_PAYLOAD"
-assert_contains "VC contiene 'credentialSubject'"                      "credentialSubject"          "$VC_PAYLOAD"
-assert_contains "VC contiene claims del sujeto"                        "Juan"                       "$VC_PAYLOAD"
+assert_contains "VC contiene el DID del holder como 'sub'"               "$HOLDER_DID"                "$VC_PAYLOAD"
+assert_contains "VC contiene 'UniversityDegreeCredential'"               "UniversityDegreeCredential" "$VC_PAYLOAD"
+assert_contains "VC contiene 'iss' (DID del issuer)"                     '"iss"'                      "$VC_PAYLOAD"
+assert_contains "VC contiene 'credentialSubject'"                        "credentialSubject"          "$VC_PAYLOAD"
+assert_contains "VC contiene claims del sujeto"                          "Juan"                       "$VC_PAYLOAD"
 
 yellow "VC emitida correctamente"
 log_section_end
@@ -425,33 +543,25 @@ do_request "POST" "$BASE_URL/credentials/issue" "application/json" \
   printf '**Aserciones:**\n\n'
 } >> "$REPORT_FILE"
 
-assert_eq "POST /credentials/issue con nonce repetido → HTTP 400" "400" "$LAST_STATUS"
+assert_eq "POST /credentials/issue con nonce consumido → HTTP 400" "400" "$LAST_STATUS"
 log_section_end
 
-# Nonce inventado
-FAKE_PROOF_DATA=$(generate_proof "nonce-inventado-$(date +%s)" "$BASE_URL")
-FAKE_PROOF=$(echo "$FAKE_PROOF_DATA" | jq -r '.proof_jwt')
-FAKE_DID=$(echo "$FAKE_PROOF_DATA"   | jq -r '.did')
-
-FAKE_DECODED=$(decode_jwt_display "$FAKE_PROOF")
-FAKE_DISPLAY=$(python3 - "$FAKE_DID" "$FAKE_DECODED" <<'PYEOF'
-import sys, json
-print(json.dumps({"holder_did": sys.argv[1], "proof": json.loads(sys.argv[2])}, indent=2, ensure_ascii=False))
-PYEOF
-)
+# DID no registrado → rechazado al intentar emitir (antes de verificar nonce)
+UNREG_KEYS=$(generate_holder_keys)
+UNREG_DID=$(echo "$UNREG_KEYS"  | jq -r '.did')
+UNREG_PRIV=$(echo "$UNREG_KEYS" | jq -r '.private_key_hex')
+FAKE_PROOF=$(sign_proof "$UNREG_PRIV" "nonce-inventado-$(date +%s)" "$BASE_URL")
 
 do_request "POST" "$BASE_URL/credentials/issue" "application/json" \
-  "{\"holder_did\":\"$FAKE_DID\",\"proof\":\"$FAKE_PROOF\"}"
+  "{\"holder_did\":\"$UNREG_DID\",\"proof\":\"$FAKE_PROOF\"}"
 
 {
-  printf '### POST /credentials/issue — nonce que nunca existió\n\n'
-  printf '**Request**\n\n```\nPOST %s/credentials/issue\nContent-Type: application/json\n\n%s\n```\n\n' \
-    "$BASE_URL" "$FAKE_DISPLAY"
+  printf '### POST /credentials/issue — DID no registrado\n\n'
   printf '**Response** — HTTP %s\n\n```json\n%s\n```\n\n' "$LAST_STATUS" "$(pretty_json "$LAST_BODY")"
   printf '**Aserciones:**\n\n'
 } >> "$REPORT_FILE"
 
-assert_eq "POST /credentials/issue con nonce inválido → HTTP 400" "400" "$LAST_STATUS"
+assert_eq "POST /credentials/issue con DID no registrado → HTTP 400" "400" "$LAST_STATUS"
 log_section_end
 echo ""
 
@@ -482,7 +592,6 @@ blue "FLUJO 4 — Revocación de Verifiable Credential"
 divider
 report_section "Flujo 4 — Revocación de Verifiable Credential"
 
-# Extraer credentialId (claim jti) del VC JWT emitido en flujo 2
 CREDENTIAL_ID=$(python3 - "$VC_JWT" <<'PYEOF'
 import sys, json, base64
 jwt = sys.argv[1]
@@ -495,11 +604,9 @@ PYEOF
 yellow "Credential ID: $CREDENTIAL_ID"
 
 # 4a. POST /credentials/{credentialId}/revoke → 204
-# Los colones en urn:uuid:... son válidos en un path segment HTTP
 do_request "POST" "$BASE_URL/credentials/${CREDENTIAL_ID}/revoke"
 log_request "POST /credentials/{credentialId}/revoke" \
   "POST" "$BASE_URL/credentials/${CREDENTIAL_ID}/revoke"
-
 assert_eq "POST /credentials/{id}/revoke → HTTP 204" "204" "$LAST_STATUS"
 log_section_end
 
@@ -507,7 +614,6 @@ log_section_end
 do_request "GET" "$BASE_URL/credentials?holder_did=$HOLDER_DID"
 log_request "GET /credentials?holder_did (verificar revoked=true)" \
   "GET" "$BASE_URL/credentials?holder_did=$HOLDER_DID"
-
 assert_eq "GET /credentials?holder_did → HTTP 200" "200" "$LAST_STATUS"
 
 REVOKED_VAL=$(echo "$LAST_BODY" | python3 -c \
@@ -515,13 +621,143 @@ REVOKED_VAL=$(echo "$LAST_BODY" | python3 -c \
 assert_eq "Metadatos muestran revoked=true" "True" "$REVOKED_VAL"
 log_section_end
 
-# 4c. POST /credentials/{credentialId}/revoke para credencial inexistente → 404
+# 4c. Credencial inexistente → 404
 FAKE_ID="urn:uuid:00000000-0000-0000-0000-000000000000"
 do_request "POST" "$BASE_URL/credentials/${FAKE_ID}/revoke"
 log_request "POST /credentials/{fake-id}/revoke — credencial inexistente" \
   "POST" "$BASE_URL/credentials/${FAKE_ID}/revoke"
-
 assert_eq "POST /credentials/{fake-id}/revoke → HTTP 404" "404" "$LAST_STATUS"
+log_section_end
+echo ""
+
+# ─── Flujo 5: Invalidación de DID ────────────────────────────────────────────
+blue "FLUJO 5 — Invalidación de DID del Holder"
+divider
+report_section "Flujo 5 — Invalidación de DID del Holder"
+
+# 5a. POST /dids/{did}/invalidate → 204
+do_request "POST" "$BASE_URL/dids/$HOLDER2_DID/invalidate"
+log_request "POST /dids/{did}/invalidate" "POST" "$BASE_URL/dids/$HOLDER2_DID/invalidate"
+assert_eq "POST /dids/{did}/invalidate → HTTP 204" "204" "$LAST_STATUS"
+log_section_end
+
+# 5b. GET /dids/{did} → active=false
+do_request "GET" "$BASE_URL/dids/$HOLDER2_DID"
+log_request "GET /dids/{did} — DID invalidado" "GET" "$BASE_URL/dids/$HOLDER2_DID"
+assert_eq "GET /dids/{did} invalidado → HTTP 200" "200" "$LAST_STATUS"
+INACTIVE_VAL=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('active',''))" 2>/dev/null || echo "")
+assert_eq "DID invalidado muestra active=false" "False" "$INACTIVE_VAL"
+assert_contains "DID invalidado tiene 'invalidated_at'" "invalidated_at" "$LAST_BODY"
+log_section_end
+
+# 5c. GET /credentials/nonce con DID invalidado → 400
+do_request "GET" "$BASE_URL/credentials/nonce?holder_did=$HOLDER2_DID"
+log_request "GET /credentials/nonce — DID invalidado" "GET" \
+  "$BASE_URL/credentials/nonce?holder_did=$HOLDER2_DID"
+assert_eq "Nonce para DID invalidado → HTTP 400" "400" "$LAST_STATUS"
+log_section_end
+
+# 5d. POST /dids/{did}/invalidate para DID inexistente → 404
+NONEXIST_DID="did:key:zQ3shFAKEDIDthatDoesNotExist123456789"
+do_request "POST" "$BASE_URL/dids/$NONEXIST_DID/invalidate"
+assert_eq "Invalidar DID inexistente → HTTP 404" "404" "$LAST_STATUS"
+log_section_end
+echo ""
+
+# ─── Flujo 6: Verificación de VP ─────────────────────────────────────────────
+blue "FLUJO 6 — Verificación de Verifiable Presentation"
+divider
+report_section "Flujo 6 — Verificación de Verifiable Presentation"
+
+# Emitir una VC fresca para el holder (la del flujo 2 ya fue revocada)
+yellow "Emitiendo VC fresca para construir la VP de verificación..."
+do_request "GET" "$BASE_URL/credentials/nonce?holder_did=$HOLDER_DID"
+NONCE2=$(echo "$LAST_BODY" | jq -r '.nonce')
+PROOF2=$(sign_proof "$HOLDER_PRIV" "$NONCE2" "$BASE_URL" "UniversityDegreeCredential")
+do_request "POST" "$BASE_URL/credentials/issue" "application/json" \
+  "{\"holder_did\":\"$HOLDER_DID\",\"proof\":\"$PROOF2\"}"
+VC_FRESH=$(echo "$LAST_BODY" | jq -r '.credential // empty')
+yellow "VC fresca emitida"
+
+# Construir VP JWT con la VC fresca
+build_vp() {
+  local priv_hex="$1" holder_did="$2" vc_jwt="$3" aud="$4"
+  python3 - "$priv_hex" "$holder_did" "$vc_jwt" "$aud" <<'PYEOF'
+import sys, json, base64, time
+try:
+    from cryptography.hazmat.primitives.asymmetric.ec import derive_private_key, SECP256K1, ECDSA
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+except ImportError:
+    print(""); sys.exit(1)
+
+ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+def b58encode(data):
+    n = int.from_bytes(data, "big"); result = []
+    while n > 0:
+        n, r = divmod(n, 58); result.append(ALPHABET[r:r+1])
+    leading = len(data) - len(data.lstrip(b"\x00"))
+    return (ALPHABET[0:1] * leading + b"".join(reversed(result))).decode()
+
+def b64url(data):
+    if isinstance(data, str): data = data.encode()
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+priv_hex, holder_did, vc_jwt, aud = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+priv_int = int.from_bytes(bytes.fromhex(priv_hex), "big")
+priv_key = derive_private_key(priv_int, SECP256K1(), default_backend())
+pub_key  = priv_key.public_key()
+pub_bytes = pub_key.public_bytes(Encoding.X962, PublicFormat.CompressedPoint)
+encoded = "z" + b58encode(bytes([0xe7, 0x01]) + pub_bytes)
+kid = "did:key:" + encoded + "#" + encoded
+now = int(time.time())
+header  = json.dumps({"alg":"ES256K","typ":"JWT","kid":kid}, separators=(",",":"))
+payload = json.dumps({"iss":holder_did,"aud":aud,"iat":now,"exp":now+300,
+    "vp":{"type":["VerifiablePresentation"],"verifiableCredential":[vc_jwt]}},
+    separators=(",",":"))
+signing_input = b64url(header) + "." + b64url(payload)
+der_sig = priv_key.sign(signing_input.encode(), ECDSA(hashes.SHA256()))
+r, s = decode_dss_signature(der_sig)
+print(signing_input + "." + b64url(r.to_bytes(32,"big") + s.to_bytes(32,"big")))
+PYEOF
+}
+
+VP_VALID=$(build_vp "$HOLDER_PRIV" "$HOLDER_DID" "$VC_FRESH" "$BASE_URL")
+# VP con la VC revocada en el flujo 4 (VC_JWT)
+VP_REVOKED=$(build_vp "$HOLDER_PRIV" "$HOLDER_DID" "$VC_JWT" "$BASE_URL")
+
+# 6a. POST /credentials/verify — VP válida → 200 con valid=true
+do_request "POST" "$BASE_URL/credentials/verify" "application/json" \
+  "{\"vp_jwt\":\"$VP_VALID\"}"
+log_request "POST /credentials/verify — VP válida" "POST" "$BASE_URL/credentials/verify"
+
+assert_eq      "POST /credentials/verify → HTTP 200"            "200"    "$LAST_STATUS"
+VALID_VAL=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('valid',''))" 2>/dev/null || echo "")
+assert_eq      "VP válida: valid=true"                          "True"   "$VALID_VAL"
+assert_contains "Respuesta contiene holder_did"                 "holder_did" "$LAST_BODY"
+assert_contains "Respuesta contiene credentials"                "credentials" "$LAST_BODY"
+assert_contains "Respuesta contiene UniversityDegreeCredential" "UniversityDegreeCredential" "$LAST_BODY"
+log_section_end
+
+# 6b. POST /credentials/verify — VP con VC revocada → 400
+do_request "POST" "$BASE_URL/credentials/verify" "application/json" \
+  "{\"vp_jwt\":\"$VP_REVOKED\"}"
+log_request "POST /credentials/verify — VP con VC revocada" "POST" "$BASE_URL/credentials/verify"
+
+assert_eq      "POST /credentials/verify con VC revocada → HTTP 400" "400"   "$LAST_STATUS"
+VALID_VAL2=$(echo "$LAST_BODY" | python3 -c \
+  "import sys,json; d=json.load(sys.stdin); print(d.get('valid',''))" 2>/dev/null || echo "")
+assert_eq      "VP con VC revocada: valid=false"                "False"  "$VALID_VAL2"
+assert_contains "Respuesta contiene 'reason'"                   '"reason"' "$LAST_BODY"
+log_section_end
+
+# 6c. POST /credentials/verify — cuerpo sin vp_jwt → 400
+do_request "POST" "$BASE_URL/credentials/verify" "application/json" "{}"
+assert_eq "POST /credentials/verify sin vp_jwt → HTTP 400" "400" "$LAST_STATUS"
 log_section_end
 echo ""
 

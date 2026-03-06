@@ -1,6 +1,6 @@
-# DID Mobile Wallet + Issuer Backend
+# DID Mobile Wallet — POC Backend
 
-Sistema de Identidad Descentralizada (DID) sin blockchain, compuesto por una wallet Android y un emisor de credenciales verificables.
+Sistema de Identidad Descentralizada (DID) sin blockchain, compuesto por una wallet Android y un backend Java.
 
 ---
 
@@ -9,8 +9,10 @@ Sistema de Identidad Descentralizada (DID) sin blockchain, compuesto por una wal
 | Actor | Rol | Dónde vive |
 |-------|-----|------------|
 | **Holder** | Dueño de la identidad. Genera su clave, solicita credenciales y las presenta. | App Android |
-| **Issuer** | Organización que emite credenciales verificables firmadas. | Backend Java |
-| **Verifier** | Quien recibe y valida una presentación del holder. | Sistema externo (no incluido) |
+| **Issuer** | Emite credenciales verificables firmadas. Registra e invalida DIDs. | Backend Java |
+| **Verifier** | Verifica presentaciones del holder: valida firmas, estado del DID y revocación de VCs. | Backend Java |
+
+> **POC:** Issuer y Verifier están implementados en el **mismo backend**, separados por endpoints distintos. En un sistema real serían organizaciones independientes.
 
 El holder es el único custodio de sus credenciales. El issuer no las almacena.
 
@@ -31,14 +33,36 @@ Holder (app)
 No requiere red. No requiere backend.
 ```
 
-### 2. Obtención de una Verifiable Credential
+### 2. Registro del DID en el issuer (primer uso)
+
+Antes de solicitar credenciales, el holder registra su DID junto a su identificador de cliente. Esto permite al issuer conocer qué DIDs están activos y a qué persona corresponden.
+
+```
+Holder (app)              Issuer (backend)
+─────────────────         ──────────────────────────────────
+
+POST /dids/register ────────────────────────────→
+{ client_id: "user@example.com",
+  did: "did:key:zQ3s..." }
+                          Guarda { did, clientId, active: true }
+                          ←────────────── { did, client_id, active: true }
+```
+
+> Si el holder pierde el dispositivo, el issuer puede invalidar ese DID con
+> `POST /dids/{did}/invalidate`. En el dispositivo nuevo se registra un DID nuevo
+> bajo el mismo `client_id`.
+
+### 3. Obtención de una Verifiable Credential
+
+El DID debe estar registrado y activo para obtener un nonce.
 
 ```
 Holder (app)              Issuer (backend)
 ─────────────────         ──────────────────────────────────
                           Tiene su propio DID e identidad
 
-1. GET /credentials/nonce ──────────────────────→
+1. GET /credentials/nonce?holder_did=did:key:z... ──→
+                          ✓ DID registrado y activo
                           ←────────────── { nonce }
 
 2. Firma un Proof JWT con su clave privada
@@ -46,7 +70,8 @@ Holder (app)              Issuer (backend)
 
 3. POST /credentials/issue ─────────────────────→
    { holder_did, proof }
-                          Verifica: firma válida + nonce válido
+                          ✓ DID activo
+                          ✓ Firma válida + nonce válido
                           Emite VC JWT firmada con su clave
                           Guarda solo metadatos (no el JWT)
                           ←────────────── { credential: <VC JWT> }
@@ -54,23 +79,44 @@ Holder (app)              Issuer (backend)
 4. Almacena la VC cifrada en el dispositivo
 ```
 
-### 3. Presentación ante un Verificador
+### 3. Presentación y verificación de una VC
+
+El holder construye una VP JWT (Verifiable Presentation) que empaqueta sus VCs y la firma con su clave privada. La envía al endpoint `POST /credentials/verify` del backend.
+
+> **POC:** el endpoint de verificación está en el mismo backend que el issuer. En producción, el Verifier sería una organización separada que consumiría los endpoints públicos del issuer (`GET /dids/{did}` y `GET /credentials?holder_did=`) para consultar estado y revocación.
 
 ```
-Holder (app)              Verifier (externo)
-─────────────────         ──────────────────────────────────
-                          Solicita presentación + nonce
+Holder (app)              Backend (Verifier + Issuer — mismo proceso)
+─────────────────         ──────────────────────────────────────────
 
 1. Toma sus VCs almacenadas
-2. Construye una VP JWT que las empaqueta
+2. Construye VP JWT:
+   { iss: holderDid,
+     aud: "http://backend",
+     vp: { verifiableCredential: [VC_JWT] } }
 3. La firma con su clave privada
-4. Envía la VP al verificador ──────────────────→
 
-                          Verifica:
-                          - Firma del holder sobre la VP
-                          - Firma del issuer sobre cada VC
-                          - Vigencia y nonce
+4. POST /credentials/verify ─────────────────→
+   { "vp_jwt": "eyJ..." }
+
+                          ✓ alg = ES256K
+                          ✓ VP no expirada
+                          ✓ Firma ES256K del holder válida
+                            (clave pública derivada del did:key del iss)
+                          ✓ DID del holder registrado y activo
+
+                          Para cada VC dentro del VP:
+                          ✓ Firma ES256K del issuer válida
+                          ✓ iss de la VC = DID de este issuer
+                          ✓ sub de la VC = holderDid del VP
+                          ✓ VC no expirada
+                          ✓ VC no revocada (consulta interna al store)
+
+   ←─── 200 { "valid": true, "holder_did": "...",
+               "credentials": [{ credential_id, type, subject, ... }] }
 ```
+
+**Por qué no se necesita red para verificar firmas:** el `did:key` contiene la clave pública — se deriva directamente del DID sin llamadas externas. Solo el estado dinámico (DID activo, VC revocada) requiere consulta al store.
 
 ---
 
@@ -128,7 +174,17 @@ DID = "did:key:z<encoded>"
 
 El DID **es** la clave pública codificada. No se registra en ningún servidor — se resuelve localmente. Quien recibe el DID puede derivar la clave pública y verificar firmas sin contactar al issuer.
 
-### Paso 2 — Pedir el nonce (usando el DID)
+### Paso 2 — Registrar el DID en el issuer (una sola vez)
+
+```
+POST /dids/register
+{ "client_id": "user@example.com", "did": "did:key:z..." }
+→ { "did": "...", "client_id": "...", "active": true }
+```
+
+El issuer solo entrega nonces a DIDs que conoce y están activos.
+
+### Paso 3 — Pedir el nonce (el DID debe estar activo)
 
 ```
 GET /credentials/nonce?holder_did=did:key:z...
@@ -137,7 +193,7 @@ GET /credentials/nonce?holder_did=did:key:z...
 
 El nonce es de un solo uso y tiene expiración de 5 minutos. Protege contra replay attacks: si alguien intercepta el Proof JWT, no puede reutilizarlo porque el nonce ya fue consumido.
 
-### Paso 3 — Firmar el Proof JWT (con la clave privada)
+### Paso 4 — Firmar el Proof JWT (con la clave privada)
 
 ```
 header  = { alg: ES256K, typ: openid4vci-proof+jwt, kid: "did:key:z...#z..." }
@@ -153,7 +209,7 @@ firma = ECDSA(SHA256(header.payload), clave_privada)
 
 La firma cubre el `nonce` — si alguien modifica el nonce, la firma es inválida.
 
-### Paso 4 — El backend verifica sin conocer la clave privada
+### Paso 5 — El backend verifica sin conocer la clave privada
 
 ```
 1. Extrae el DID del campo iss
@@ -175,22 +231,94 @@ App Android / Postman                  Issuer Backend
    → deriva DID del holder
    → guarda en .holder-keys
 
-2. GET /nonce?holder_did=did:key:z... ─────────────────────────────▶
-                                       guarda nonce para ese DID
+2. POST /dids/register ────────────────────────────────────────────▶
+   { client_id: "user@example.com", did: "did:key:z..." }
+                                       guarda { did, clientId, active: true }
+   ◀─ { active: true } ───────────────────────────────────────────
+
+3. GET /credentials/nonce?holder_did=did:key:z... ─────────────────▶
+                                       ✓ DID registrado y activo
+                                       guarda nonce de un solo uso
    ◀─ { nonce: "abc123" } ────────────────────────────────────────
 
-3. ./scripts/gen-proof.sh <nonce>
+4. ./scripts/gen-proof.sh <nonce>
    → lee clave privada de .holder-keys
    → firma JWT con nonce + subject_claims
    → imprime PROOF_JWT
 
-4. POST /credentials/issue ────────────────────────────────────────▶
+5. POST /credentials/issue ────────────────────────────────────────▶
    { holder_did, proof: PROOF_JWT }
-                                       verifica firma (clave pública del DID)
-                                       verifica nonce (consumido, one-time)
+                                       ✓ DID activo
+                                       ✓ firma válida (clave pública del DID)
+                                       ✓ nonce consumido (one-time)
                                        emite VC JWT firmada por el issuer
    ◀─ { credential: "eyJ..." } ───────────────────────────────────
 ```
+
+---
+
+## Cómo funciona el VP JWT
+
+El VP JWT (Verifiable Presentation) es el mecanismo con el que el holder demuestra ante el Verifier que posee una o más VCs. Lo construye él mismo, lo firma con su clave privada y lo envía al backend.
+
+### Qué contiene
+
+```
+header  = { alg: ES256K, typ: JWT, kid: "did:key:z...#z..." }
+payload = {
+    iss: "did:key:z..."           ← DID del holder (quién presenta)
+    aud: "https://backend"        ← a quién va dirigido
+    iat: <unix timestamp>
+    exp: <unix timestamp + 300>   ← válido 5 minutos
+    vp: {
+        type: ["VerifiablePresentation"],
+        verifiableCredential: [   ← lista de VCs JWT a presentar
+            "eyJ...VC_JWT..."
+        ]
+    }
+}
+firma = ECDSA(SHA256(header.payload), clave_privada_del_holder)
+```
+
+La diferencia clave con el Proof JWT: **no lleva nonce del issuer**. La VP se construye de forma autónoma — el holder decide cuándo y qué presenta.
+
+### Qué verifica el backend al recibirlo
+
+```
+1. alg = ES256K
+2. exp > ahora (presentación no expirada)
+3. Derivar clave pública del holder desde el campo iss (did:key)
+4. Verificar firma ES256K sobre header.payload
+5. DID del holder está registrado y activo (consulta al store)
+
+Por cada VC en vp.verifiableCredential:
+6. Verificar firma ES256K del issuer (clave pública derivada del iss de la VC)
+7. iss de la VC == DID de este issuer (rechaza VCs de issuers desconocidos)
+8. sub de la VC == iss del VP (la VC le pertenece al holder que presenta)
+9. exp de la VC > ahora
+10. VC no revocada (consulta al store por su jti)
+```
+
+### Flujo completo de verificación
+
+```
+App Android / Terminal                 Backend (Verifier)
+──────────────────────                 ──────────────────────────────
+(ya tienes .holder-keys y VC_JWT)
+
+./scripts/gen-vp.sh <VC_JWT>
+  → lee clave privada de .holder-keys
+  → construye VP JWT con la VC
+  → firma con ES256K
+  → POST /credentials/verify ────────────────────────────────────▶
+                                        ✓ firma del holder
+                                        ✓ DID activo
+                                        ✓ firma del issuer en la VC
+                                        ✓ VC no revocada
+    ◀── { valid: true, holder_did, credentials: [...] } ─────────
+```
+
+---
 
 ### Para pruebas con Postman
 
@@ -200,16 +328,27 @@ App Android / Postman                  Issuer Backend
 # → imprime HOLDER_DID, guarda .holder-keys
 # → copiar HOLDER_DID a la variable HOLDER_DID de la colección
 
-# Paso 2 — obtener nonce (ejecutar "GET Nonce" en Postman)
+# Paso 2 — registrar DID en el issuer (ejecutar "POST Register DID" en Postman)
+# → body: { "client_id": "user@example.com", "did": "{{HOLDER_DID}}" }
+
+# Paso 3 — obtener nonce (ejecutar "GET Nonce" en Postman)
 # → NONCE se guarda automáticamente en la variable de colección
 
-# Paso 3 — generar proof con el nonce
+# Paso 4 — generar proof con el nonce
 ./scripts/gen-proof.sh <NONCE>
 # → imprime PROOF_JWT
 # → copiar a la variable PROOF_JWT de la colección
 
-# Paso 4 — ejecutar "POST Issue VC" en Postman
+# Paso 5 — ejecutar "POST Issue VC" en Postman
+# → guarda el valor de "credential" (VC_JWT)
+
+# Paso 6 — generar y enviar la VP (ejecuta curl automáticamente)
+./scripts/gen-vp.sh <VC_JWT>
+# → imprime VP_JWT y resultado del backend (valid: true/false)
+# → para probarlo en Postman: copiar VP_JWT a "POST Verify VP"
 ```
+
+Ver [README-postman.md](README-postman.md) para la guía completa paso a paso.
 
 ---
 
@@ -244,15 +383,16 @@ App Android / Postman                  Issuer Backend
 ```json
 {
   "iss": "did:key:zQ3s...",
-  "aud": "did:web:verifier.example.com",
-  "nonce": "verifier-nonce",
+  "aud": "https://backend.example.com",
+  "iat": 1772674193,
+  "exp": 1772674493,
   "vp": {
     "type": ["VerifiablePresentation"],
     "verifiableCredential": ["<VC_JWT>"]
   }
 }
 ```
-*Firmado con la clave privada del holder (ES256K).*
+*Firmado con la clave privada del holder (ES256K). Válido 5 minutos. Sin nonce — el holder lo construye de forma autónoma.*
 
 ---
 
@@ -287,7 +427,8 @@ La clave AES no tiene rol criptográfico en el protocolo DID — su único traba
 2. **Un DID propio** — derivado de su clave pública (`did:key`)
 3. **Endpoint de nonce** — protege contra replay attacks
 4. **Endpoint de emisión** — verifica el proof y firma la VC
-5. **Base de datos** — solo para metadatos de auditoría (H2 en dev, PostgreSQL en prod)
+5. **Registro de DIDs** — saber qué DIDs están activos y a qué cliente pertenecen
+6. **Persistencia** — solo metadatos de auditoría (H2 en local, Azure Table Storage en cloud)
 
 No se necesita blockchain, PKI propia ni registro DID externo. `did:key` se resuelve localmente a partir del propio DID.
 
@@ -295,11 +436,29 @@ No se necesita blockchain, PKI propia ni registro DID externo. `did:key` se resu
 
 ## Endpoints del backend
 
+### Gestión de DIDs del holder
+
 | Método | URL | Descripción |
 |--------|-----|-------------|
-| `GET`  | `/credentials/nonce` | Nonce de un solo uso para el holder |
+| `POST` | `/dids/register` | Registra un DID asociado a un `client_id` |
+| `GET`  | `/dids/{did}` | Estado del DID (activo/inactivo) — para verificadores |
+| `POST` | `/dids/{did}/invalidate` | Invalida un DID (dispositivo perdido o app borrada) |
+| `GET`  | `/clients/{clientId}/dids` | Lista todos los DIDs de un cliente |
+
+### Credenciales
+
+| Método | URL | Descripción |
+|--------|-----|-------------|
+| `GET`  | `/credentials/nonce?holder_did=` | Nonce de un solo uso (DID debe estar activo) |
 | `POST` | `/credentials/issue` | Recibe proof JWT, emite VC JWT |
+| `POST` | `/credentials/verify` | Verifica una VP JWT (firma, DID activo, VCs no revocadas) |
 | `GET`  | `/credentials?holder_did=` | Metadatos de VCs emitidas (sin contenido) |
+| `POST` | `/credentials/{credentialId}/revoke` | Revoca una VC por su ID |
+
+### Identidad del issuer
+
+| Método | URL | Descripción |
+|--------|-----|-------------|
 | `GET`  | `/issuer/did` | DID e info del issuer |
 | `GET`  | `/issuer/did-document` | DID Document del issuer |
 
@@ -320,10 +479,22 @@ didbmo/
 │
 └── backend/src/main/java/com/did/issuer/
     ├── config/IssuerKeyConfig.java       ← clave e identidad del issuer
-    ├── controller/CredentialController.java
+    ├── controller/
+    │   ├── CredentialController.java     ← nonce, issue, revoke, metadatos
+    │   └── HolderDIDController.java      ← register, invalidate, status
     ├── service/
     │   ├── NonceService.java             ← nonces single-use
     │   ├── ProofVerifier.java            ← verifica proof JWT
-    │   └── CredentialIssuerService.java  ← emite y firma VCs
-    └── model/CredentialRecord.java       ← metadatos de auditoría
+    │   ├── CredentialIssuerService.java  ← emite y firma VCs
+    │   └── HolderDIDService.java         ← registro e invalidación de DIDs
+    ├── store/
+    │   ├── CredentialStore.java          ← interface
+    │   ├── JpaCredentialStore.java       ← H2 (local)
+    │   ├── AzureTableCredentialStore.java← Azure Table Storage
+    │   ├── HolderDIDStore.java           ← interface
+    │   ├── JpaHolderDIDStore.java        ← H2 (local)
+    │   └── AzureTableHolderDIDStore.java ← Azure Table Storage
+    └── model/
+        ├── CredentialRecord.java         ← metadatos de VC emitida
+        └── HolderDIDRecord.java          ← registro de DID del holder
 ```

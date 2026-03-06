@@ -48,14 +48,16 @@ public class CredentialIssuerService {
         this.store      = store;
     }
 
+    public record IssueResult(String credentialId, String credentialJwt) {}
+
     /**
      * Emite una VC JWT para el holder indicado.
      *
      * @param holderDid     DID del titular de la credencial
      * @param proofPayload  Payload del proof JWT (para extraer subject_claims)
-     * @return VC en formato JWT compacto
+     * @return IssueResult con credentialId y el JWT de la VC
      */
-    public String issue(String holderDid, String proofPayload) throws Exception {
+    public IssueResult issue(String holderDid, String proofPayload) throws Exception {
         JsonNode claims    = extractSubjectClaims(proofPayload);
         String   credType  = extractCredentialType(proofPayload);
         String   vcId      = "urn:uuid:" + UUID.randomUUID();
@@ -127,7 +129,7 @@ public class CredentialIssuerService {
         store.save(record);
 
         log.info("VC emitida: {} para {}", vcId, holderDid);
-        return vcJwt;
+        return new IssueResult(vcId, vcJwt);
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────

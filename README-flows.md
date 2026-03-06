@@ -84,53 +84,46 @@ sequenceDiagram
 
 ---
 
-## 3. Presentación ante un Verificador
+## 3. Presentación y verificación de una VP
+
+> **POC:** el Verifier y el Issuer son el **mismo backend**. El endpoint `POST /credentials/verify` actúa como Verifier. En producción serían organizaciones separadas.
 
 ```mermaid
 sequenceDiagram
-    participant V as 🔍 Verifier (externo)
     participant A as 📱 App Android (Holder)
-    participant B as 🖥️ Backend (Issuer)
-
-    V->>A: solicitar presentación<br/>{ nonce: "vrf9x...", requested_types: [...] }
+    participant B as 🖥️ Backend (Issuer + Verifier — POC)
 
     Note over A: el holder decide qué VCs compartir
 
     A->>A: leer VCs de EncryptedSharedPreferences
-    A->>A: seleccionar VCs que satisfacen el request
-
     A->>A: header VP:<br/>{ alg: "ES256K", typ: "JWT",<br/>  kid: "did:key:zQ3sh...#zQ3sh..." }
-    A->>A: payload VP:<br/>{ iss: "did:key:zQ3sh...",<br/>  aud: verifierDid,<br/>  iat: now, exp: now+300,<br/>  nonce: "vrf9x...",<br/>  vp: { type: ["VerifiablePresentation"],<br/>        verifiableCredential: ["eyJ...vc1"] } }
+    A->>A: payload VP:<br/>{ iss: "did:key:zQ3sh...",<br/>  aud: "https://backend...",<br/>  iat: now, exp: now+300,<br/>  vp: { type: ["VerifiablePresentation"],<br/>        verifiableCredential: ["eyJ...vc1"] } }
     A->>A: descifrar clave privada (Keystore)<br/>firmar VP con ES256K<br/>limpiar clave privada de RAM
 
-    A->>V: VP JWT<br/>"eyJhbGci..."
+    A->>+B: POST /credentials/verify<br/>{ "vp_jwt": "eyJhbGci..." }
 
-    Note over V: verificar la VP
+    Note over B: verificar la VP
 
-    V->>V: ✓ clave pública del holder (did:key del iss → 33 bytes)
-    V->>V: ✓ firma ES256K del VP JWT
-    V->>V: ✓ nonce coincide con el enviado
-    V->>V: ✓ exp > now
+    B->>B: ✓ alg == ES256K
+    B->>B: ✓ VP exp > now
+    B->>B: ✓ clave pública del holder (did:key del iss → 33 bytes)<br/>  verificar firma ES256K del VP
 
-    Note over V: verificar cada VC dentro del VP
+    B->>B: ✓ DID del holder registrado y activo<br/>  (consulta interna al store)
+
+    Note over B: verificar cada VC dentro del VP
 
     loop por cada VC en vp.verifiableCredential
-        V->>V: ✓ clave pública del issuer (did:key del vc.iss → 33 bytes)
-        V->>V: ✓ firma ES256K de la VC
-        V->>V: ✓ vc.exp > now
-        V->>V: ✓ vc.sub == holderDid del VP
+        B->>B: ✓ iss de la VC == DID de este issuer
+        B->>B: ✓ clave pública del issuer (did:key del iss → 33 bytes)<br/>  verificar firma ES256K de la VC
+        B->>B: ✓ vc.sub == holderDid del VP
+        B->>B: ✓ vc.exp > now
+        B->>B: ✓ VC no revocada (consulta interna al store)
     end
 
-    opt verificar revocación (opcional pero recomendado)
-        V->>+B: GET /credentials?holder_did=did:key:zQ3sh...
-        B-->>-V: 200 OK<br/>[{ "credential_id": "urn:uuid:...",<br/>   "revoked": false,<br/>   "expires_at": "2027-..." }]
-        V->>V: ✓ ninguna VC está revocada
-    end
-
-    V->>A: ✓ presentación válida
+    B-->>-A: 200 OK<br/>{ "valid": true,<br/>  "holder_did": "did:key:zQ3sh...",<br/>  "credentials": [{ credential_id, type, subject, expires_at }] }
 ```
 
-> El verifier resuelve la clave del issuer directamente desde su `did:key` — sin contactarlo.
+> La clave pública del issuer se deriva directamente de su `did:key` — no se necesita llamada externa.
 > El holder controla qué VCs incluye en cada presentación.
 
 ---
@@ -160,12 +153,75 @@ sequenceDiagram
 
 ---
 
-## 5. Endpoints — referencia rápida
+## 5. Registro e Invalidación de DID
+
+El DID debe estar registrado en el backend antes de poder solicitar credenciales.
+Si el holder pierde el dispositivo, el issuer puede invalidar el DID.
+
+```mermaid
+sequenceDiagram
+    participant A as 📱 App Android (Holder)
+    participant ADM as 👤 Administrador / App
+    participant B as 🖥️ Backend (Issuer)
+    participant TS as 🗄️ Table Storage
+
+    Note over A,B: Primer uso — registrar DID tras instalar la app
+
+    A->>+B: POST /dids/register<br/>{ "client_id": "user@example.com",<br/>  "did": "did:key:zQ3sh..." }
+    B->>TS: guardar { did, clientId, registeredAt,<br/>          active: true }
+    TS-->>B: ok
+    B-->>-A: 200 { did, client_id, active: true,<br/>              registered_at: "..." }
+
+    Note over A,B: Flujo normal — nonce solo para DIDs activos
+
+    A->>+B: GET /credentials/nonce?holder_did=did:key:zQ3sh...
+    B->>B: ✓ DID registrado y activo
+    B-->>-A: 200 { "nonce": "a3f7..." }
+
+    Note over ADM,B: Pérdida de dispositivo — invalidar DID
+
+    ADM->>+B: POST /dids/did:key:zQ3sh.../invalidate
+    B->>TS: active = false, invalidatedAt = now
+    TS-->>B: ok
+    B-->>-ADM: 204 No Content
+
+    Note over A,B: DID invalidado — nonce rechazado
+
+    A->>+B: GET /credentials/nonce?holder_did=did:key:zQ3sh...
+    B->>B: ✗ DID invalidado
+    B-->>-A: 400 { "error": "DID invalidado: ..." }
+
+    Note over A,B: Nuevo dispositivo — nuevo DID
+
+    A->>A: generar nueva clave secp256k1<br/>nuevo DID derivado
+    A->>+B: POST /dids/register<br/>{ "client_id": "user@example.com",<br/>  "did": "did:key:zNUEVO..." }
+    B-->>-A: 200 { active: true }
+    Note right of B: el mismo client_id tiene ahora<br/>dos DIDs: uno inactivo y uno activo
+```
+
+> El `client_id` es un identificador que el issuer ya conoce (email, userId, DNI, etc.)
+> El issuer decide si acepta el re-registro del mismo cliente en un dispositivo nuevo.
+
+---
+
+## 6. Endpoints — referencia rápida
 
 ```mermaid
 sequenceDiagram
     participant C as Cliente
     participant B as 🖥️ Backend
+
+    C->>+B: POST /dids/register<br/>{ client_id, did }
+    B-->>-C: 200 { did, client_id, active, registered_at }
+
+    C->>+B: GET /dids/{did}
+    B-->>-C: 200 { did, client_id, active, registered_at, invalidated_at? }
+
+    C->>+B: POST /dids/{did}/invalidate
+    B-->>-C: 204 No Content
+
+    C->>+B: GET /clients/{clientId}/dids
+    B-->>-C: 200 [{ did, active, registered_at, ... }]
 
     C->>+B: GET /issuer/did
     B-->>-C: 200 { "did": "did:key:z...", "public_key_hex": "03..." }
@@ -174,10 +230,13 @@ sequenceDiagram
     B-->>-C: 200 { "@context", "id", "verificationMethod", "authentication" }
 
     C->>+B: GET /credentials/nonce?holder_did=did:key:z...
-    B-->>-C: 200 { "nonce": "a3f7..." }
+    B-->>-C: 200 { "nonce": "a3f7..." }  ← 400 si DID no activo
 
     C->>+B: POST /credentials/issue<br/>{ holder_did, proof, credentialType }
-    B-->>-C: 200 { "credential": "eyJ..." }
+    B-->>-C: 200 { "credential": "eyJ..." }  ← 400 si DID no activo
+
+    C->>+B: POST /credentials/verify<br/>{ vp_jwt }
+    B-->>-C: 200 { valid, holder_did, credentials[] }<br/>← 400 { valid: false, reason } si inválida
 
     C->>+B: GET /credentials?holder_did=did:key:z...
     B-->>-C: 200 [{ credential_id, credential_type,<br/>         issued_at, expires_at, revoked }]

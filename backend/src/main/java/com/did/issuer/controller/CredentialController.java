@@ -5,8 +5,10 @@ import com.did.issuer.dto.CredentialRequest;
 import com.did.issuer.model.CredentialRecord;
 import com.did.issuer.service.CredentialIssuerService;
 import com.did.issuer.service.DIDKeyUtil;
+import com.did.issuer.service.HolderDIDService;
 import com.did.issuer.service.NonceService;
 import com.did.issuer.service.ProofVerifier;
+import com.did.issuer.service.VPVerifierService;
 import com.did.issuer.store.CredentialStore;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
@@ -35,29 +37,41 @@ public class CredentialController {
     private final CredentialIssuerService issuerService;
     private final CredentialStore         store;
     private final IssuerKeys              issuerKeys;
+    private final HolderDIDService        holderDIDService;
+    private final VPVerifierService       vpVerifier;
 
     public CredentialController(
         NonceService nonceService,
         ProofVerifier proofVerifier,
         CredentialIssuerService issuerService,
         CredentialStore store,
-        IssuerKeys issuerKeys
+        IssuerKeys issuerKeys,
+        HolderDIDService holderDIDService,
+        VPVerifierService vpVerifier
     ) {
-        this.nonceService  = nonceService;
-        this.proofVerifier = proofVerifier;
-        this.issuerService = issuerService;
-        this.store         = store;
-        this.issuerKeys    = issuerKeys;
+        this.nonceService     = nonceService;
+        this.proofVerifier    = proofVerifier;
+        this.issuerService    = issuerService;
+        this.store            = store;
+        this.issuerKeys       = issuerKeys;
+        this.holderDIDService = holderDIDService;
+        this.vpVerifier       = vpVerifier;
     }
 
     // ── Nonce ────────────────────────────────────────────────────────────────
 
     /**
      * Devuelve un nonce de un solo uso.
-     * El holder debe incluirlo en el proof JWT antes de solicitar una VC.
+     * El holder_did debe estar registrado y activo para obtener el nonce.
      */
     @GetMapping("/credentials/nonce")
-    public ResponseEntity<Map<String, String>> nonce() {
+    public ResponseEntity<?> nonce(@RequestParam("holder_did") String holderDid) {
+        try {
+            holderDIDService.assertActive(holderDid);
+        } catch (IllegalArgumentException e) {
+            log.warn("Nonce rechazado — DID inválido: {}", e.getMessage());
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
         return ResponseEntity.ok(Map.of("nonce", nonceService.generate()));
     }
 
@@ -75,16 +89,23 @@ public class CredentialController {
     @PostMapping("/credentials/issue")
     public ResponseEntity<?> issue(@Valid @RequestBody CredentialRequest request) {
         try {
-            // 1. Verificar proof JWT (firma + nonce + expiración + iss)
+            // 1. Verificar que el DID está registrado y activo
+            holderDIDService.assertActive(request.getHolderDid());
+
+            // 2. Verificar proof JWT (firma + nonce + expiración + iss)
             proofVerifier.verify(request.getProof(), request.getHolderDid());
 
-            // 2. Extraer el payload para obtener subject_claims y credential_type
+            // 3. Extraer el payload para obtener subject_claims y credential_type
             String proofPayloadPart = request.getProof().split("\\.")[1];
 
-            // 3. Emitir y persistir la VC
-            String vcJwt = issuerService.issue(request.getHolderDid(), proofPayloadPart);
+            // 4. Emitir y persistir la VC
+            CredentialIssuerService.IssueResult result =
+                issuerService.issue(request.getHolderDid(), proofPayloadPart);
 
-            return ResponseEntity.ok(Map.of("credential", vcJwt));
+            return ResponseEntity.ok(Map.of(
+                "credentialId", result.credentialId(),
+                "credential",   result.credentialJwt()
+            ));
 
         } catch (IllegalArgumentException e) {
             log.warn("Credential request rechazada: {}", e.getMessage());
@@ -136,6 +157,36 @@ public class CredentialController {
         return revoked
             ? ResponseEntity.noContent().build()
             : ResponseEntity.notFound().build();
+    }
+
+    // ── Verificación de VP ────────────────────────────────────────────────────
+
+    /**
+     * Verifica una Verifiable Presentation (VP JWT) enviada por un holder.
+     *
+     * Body: { "vp_jwt": "eyJ..." }
+     *
+     * Respuesta 200 si es válida:
+     *   { "valid": true, "holder_did": "...", "credentials": [...] }
+     *
+     * Respuesta 400 si es inválida:
+     *   { "valid": false, "reason": "..." }
+     */
+    @PostMapping("/credentials/verify")
+    public ResponseEntity<Map<String, Object>> verifyVP(@RequestBody Map<String, String> body) {
+        String vpJwt = body.get("vp_jwt");
+        if (vpJwt == null || vpJwt.isBlank()) {
+            return ResponseEntity.badRequest()
+                .body(Map.of("valid", false, "reason", "El campo vp_jwt es requerido"));
+        }
+        try {
+            Map<String, Object> result = vpVerifier.verify(vpJwt);
+            return ResponseEntity.ok(result);
+        } catch (IllegalArgumentException e) {
+            log.warn("VP rechazada: {}", e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(Map.of("valid", false, "reason", e.getMessage()));
+        }
     }
 
     // ── Info del emisor ───────────────────────────────────────────────────────

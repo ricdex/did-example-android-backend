@@ -11,9 +11,10 @@ Esta guía explica la lógica que la app Android debe implementar en relación a
 3. [Compresión de la clave pública](#3-compresión-de-la-clave-pública)
 4. [Derivación del DID](#4-derivación-del-did)
 5. [Proof JWT y VC JWT — estructura, firma y validación](#5-proof-jwt-y-vc-jwt--estructura-firma-y-validación)
-6. [Verificación de la VC al recibirla](#6-verificación-de-la-vc-al-recibirla)
-7. [Protección de la clave privada en Android](#7-protección-en-android)
-8. [Equivalencia Android ↔ Python](#8-equivalencia-android--python)
+6. [VP JWT — presentación de credenciales](#6-vp-jwt--presentación-de-credenciales)
+7. [Verificación de la VC al recibirla](#7-verificación-de-la-vc-al-recibirla)
+8. [Protección de la clave privada en Android](#8-protección-en-android)
+9. [Equivalencia Android ↔ Python](#9-equivalencia-android--python)
 
 ---
 
@@ -208,7 +209,7 @@ public String getKeyId(String did) {
 
 ---
 
-## 5. Proof JWT y VC JWT — estructura, firma y validación
+## 5. Proof JWT, VC JWT y VP JWT — estructura, firma y validación
 
 ---
 
@@ -417,71 +418,224 @@ El verifier no necesita contactar al issuer para verificar la firma — la clave
 
 ---
 
+## VP JWT
+
+Lo genera el **holder** para presentar una o más VCs ante el Verifier. Es el mecanismo con el que demuestra que posee esas credenciales sin revelar su clave privada.
+
+### Qué es y por qué existe
+
+El VC JWT acredita al holder (lo emite el issuer). Pero para enviarlo a un verifier, el holder necesita demostrarse a sí mismo como el titular — para eso lo envuelve en una VP JWT que firma con su propia clave.
+
+Diferencia con el Proof JWT: la VP no necesita nonce del issuer. El holder la construye de forma autónoma, decide qué VCs incluye y decide cuándo la envía.
+
+### Cómo se arma
+
+**Header** (`VPBuilder.java` / `gen-vp.sh`):
+
+```json
+{
+  "alg": "ES256K",
+  "typ": "JWT",
+  "kid": "did:key:zQ3sh...#zQ3sh..."
+}
+```
+
+| Campo | Valor | Propósito |
+|-------|-------|-----------|
+| `alg` | `ES256K` | Algoritmo de firma. El backend rechaza si no es ES256K. |
+| `typ` | `JWT` | Tipo de token estándar. |
+| `kid` | `did#fragment` | Apunta a la clave pública del holder para verificar la firma. |
+
+**Payload** (`VPBuilder.java` / `gen-vp.sh`):
+
+```json
+{
+  "iss": "did:key:zQ3sh...",
+  "aud": "https://backend.example.com",
+  "iat": 1772674193,
+  "exp": 1772674493,
+  "vp": {
+    "type": ["VerifiablePresentation"],
+    "verifiableCredential": [
+      "eyJhbGci...VC_JWT_1...",
+      "eyJhbGci...VC_JWT_2..."
+    ]
+  }
+}
+```
+
+| Campo | Quién lo pone | Propósito |
+|-------|---------------|-----------|
+| `iss` | Holder (su DID) | Identifica quién presenta. Se usa para derivar la clave pública y verificar la firma. |
+| `aud` | Holder (URL del verifier) | Ata la VP a un destinatario específico. Otro verifier no puede reutilizarla. |
+| `iat` / `exp` | Holder | Ventana de validez de **5 minutos**. Una VP interceptada después expira. |
+| `vp.verifiableCredential` | Holder | Array de VC JWTs a presentar. El holder elige cuáles incluir. |
+
+### Con qué se firma
+
+Con la **clave privada secp256k1 del holder** (`VPBuilder.java` / `gen-vp.sh`):
+
+```
+signing_input = base64url(header) + "." + base64url(payload)
+firma         = ES256K(signing_input, clave_privada_holder)
+vp_jwt        = signing_input + "." + base64url(firma)
+```
+
+La clave privada nunca sale del dispositivo. Las VCs en el interior de la VP están firmadas por el issuer — el holder no puede modificarlas sin invalidar esas firmas.
+
+### Cómo lo valida el backend
+
+`VPVerifierService.java` — en orden:
+
+```
+1. Verificar que tiene 3 partes separadas por "."
+2. alg == "ES256K"                                → si no, rechazar
+3. exp > ahora                                    → si expiró, rechazar
+4. Extraer clave pública del holder desde iss:
+   did:key:z<encoded> → base58decode → quitar [0xe7,0x01] → 33 bytes
+5. Verificar la firma ES256K del VP con esa clave pública
+6. DID del holder registrado y activo (consulta al store)
+
+Por cada VC en vp.verifiableCredential:
+7. iss de la VC == DID de este issuer              → si no, rechazar
+8. Extraer clave pública del issuer desde su DID
+9. Verificar la firma ES256K de la VC con esa clave pública
+10. sub de la VC == iss del VP (el holder es el titular)
+11. exp de la VC > ahora
+12. VC no revocada (consulta al store por su jti)
+```
+
+Respuesta si todo es válido:
+```json
+{
+  "valid": true,
+  "holder_did": "did:key:zQ3sh...",
+  "credentials": [
+    {
+      "credential_id": "urn:uuid:...",
+      "type": "UniversityDegreeCredential",
+      "subject": { "givenName": "Juan", "familyName": "Pérez", "email": "juan@example.com" },
+      "expires_at": "2027-..."
+    }
+  ]
+}
+```
+
+### En Python — `gen-vp.sh`
+
+```python
+now = int(time.time())
+
+header_json = json.dumps({"alg": "ES256K", "typ": "JWT", "kid": kid})
+payload_json = json.dumps({
+    "iss": holder_did,
+    "aud": base_url,
+    "iat": now,
+    "exp": now + 300,
+    "vp": {
+        "type": ["VerifiablePresentation"],
+        "verifiableCredential": [vc_jwt]
+    }
+})
+
+signing_input = b64url(header_json) + "." + b64url(payload_json)
+der_sig       = priv_key.sign(signing_input.encode(), ECDSA(hashes.SHA256()))
+r, s          = decode_dss_signature(der_sig)
+sig_bytes     = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+vp_jwt        = signing_input + "." + b64url(sig_bytes)
+```
+
+### Uso desde terminal
+
+```bash
+# Ya tienes .holder-keys (de gen-holder.sh) y VC_JWT (de la emisión)
+./scripts/gen-vp.sh <VC_JWT>
+
+# Contra Azure
+./scripts/gen-vp.sh <VC_JWT> https://did-issuer-app.azurecontainerapps.io
+```
+
+---
+
 ## Flujo completo end-to-end
 
 ```
-HOLDER                          ISSUER                        VERIFIER
-──────                          ──────                        ────────
-Tiene: clave privada
-       clave pública
-       DID (del DID)
+HOLDER                          ISSUER / VERIFIER (mismo backend en POC)
+──────                          ─────────────────────────────────────────
 
-GET /nonce ─────────────────────▶
-                                 genera nonce
-                                 guarda (nonce → holderDid, TTL 5min)
+── Registro ────────────────────────────────────────────────────────────
+
+POST /dids/register ────────────▶
+  { client_id, did }
+                                 guarda { did, clientId, active: true }
+◀─ { active: true } ────────────
+
+── Emisión de VC ───────────────────────────────────────────────────────
+
+GET /credentials/nonce ─────────▶
+                                 ✓ DID registrado y activo
+                                 genera nonce (TTL 5 min, one-time)
 ◀─ { nonce } ───────────────────
 
 Arma Proof JWT:
-  header { alg, typ, kid }
-  payload { iss=DID, aud=URL,
+  header { alg: ES256K,
+           typ: openid4vci-proof+jwt, kid }
+  payload { iss=holderDID, aud=URL,
             nonce, subject_claims }
   firma con clave privada
 
-POST /issue ────────────────────▶
-  { holder_did, proof: JWT }
-                                 verifica Proof JWT:
-                                   alg, iss, exp, nonce, firma
+POST /credentials/issue ────────▶
+  { holder_did, proof: Proof JWT }
+                                 ✓ alg, iss, exp, nonce, firma
                                  consume el nonce
-                                 arma VC JWT:
-                                   header { kid=issuerDID }
-                                   payload { iss=issuerDID,
-                                             sub=holderDID,
-                                             vc { credentialSubject } }
-                                   firma con clave privada del issuer
+                                 arma VC JWT firmada con clave del issuer
                                  guarda solo hash + metadatos
 ◀─ { credential: VC_JWT } ──────
 
 Guarda VC_JWT en dispositivo
 (cifrado, nunca en claro)
 
-                                               Presenta VC_JWT ─────────▶
-                                                                          verifica firma
-                                                                          con clave pública
-                                                                          del issuer (del DID)
-                                                                          verifica exp, sub
-                                                                ◀─ ok ───
+── Presentación ────────────────────────────────────────────────────────
+
+Arma VP JWT:
+  header { alg: ES256K, typ: JWT, kid }
+  payload { iss=holderDID, aud=URL,
+            exp=now+300,
+            vp { verifiableCredential: [VC_JWT] } }
+  firma con clave privada
+
+POST /credentials/verify ───────▶
+  { vp_jwt: VP JWT }
+                                 ✓ alg, exp, firma del holder
+                                 ✓ DID del holder activo
+                                 ✓ firma del issuer en cada VC
+                                 ✓ sub de VC == holder, exp > now
+                                 ✓ VC no revocada
+◀─ { valid: true, credentials } ─
 ```
 
 ---
 
-## Diferencias clave entre Proof JWT y VC JWT
+## Diferencias clave entre Proof JWT, VC JWT y VP JWT
 
-| | Proof JWT | VC JWT |
-|--|-----------|--------|
-| **Lo genera** | Holder | Issuer |
-| **Lo firma** | Clave privada del holder | Clave privada del issuer |
-| **Se verifica con** | Clave pública del holder (del DID) | Clave pública del issuer (del DID) |
-| **`iss`** | DID del holder | DID del issuer |
-| **`aud` / `sub`** | `aud` = URL del issuer | `sub` = DID del holder |
-| **`typ`** | `openid4vci-proof+jwt` | `JWT` |
-| **Vida útil** | 5 minutos | 24 horas (configurable) |
-| **Propósito** | Demostrar posesión de clave para pedir una VC | Credencial verificable emitida por el issuer |
-| **Nonce** | Sí (anti-replay) | No |
-| **Se guarda** | No (descartable tras verificar) | Sí, en el dispositivo del holder |
+| | Proof JWT | VC JWT | VP JWT |
+|--|-----------|--------|--------|
+| **Lo genera** | Holder | Issuer | Holder |
+| **Lo firma** | Clave privada del holder | Clave privada del issuer | Clave privada del holder |
+| **Se verifica con** | Clave pública del holder (del DID) | Clave pública del issuer (del DID) | Clave pública del holder (del DID) |
+| **`iss`** | DID del holder | DID del issuer | DID del holder |
+| **`aud` / `sub`** | `aud` = URL del issuer | `sub` = DID del holder | `aud` = URL del verifier |
+| **`typ`** | `openid4vci-proof+jwt` | `JWT` | `JWT` |
+| **Vida útil** | 5 minutos | 24 horas (configurable) | 5 minutos |
+| **Propósito** | Demostrar posesión de clave para pedir una VC | Credencial verificable emitida por el issuer | Presentar una o más VCs ante un verifier |
+| **Nonce** | Sí (del issuer, anti-replay) | No | No |
+| **Contiene VCs** | No | N/A (es la VC) | Sí (`vp.verifiableCredential[]`) |
+| **Se guarda** | No (descartable tras verificar) | Sí, en el dispositivo del holder | No (efímera, se crea al momento de presentar) |
+| **Script de ejemplo** | `gen-proof.sh` | — | `gen-vp.sh` |
 
 ---
 
-## 6. Verificación de la VC al recibirla
+## 7. Verificación de la VC al recibirla
 
 Cuando el holder recibe el VC JWT del issuer, **debe verificarlo antes de guardarlo**. Actualmente `CredentialService.java` lo guarda directamente sin validar — esta sección describe la lógica que falta implementar.
 
@@ -578,7 +732,7 @@ La verificación de firma requiere agregar un método equivalente a `DIDKeyUtil.
 
 ---
 
-## 7. Protección de la clave privada en Android
+## 8. Protección de la clave privada en Android
 
 Esta parte **no existe** en los scripts Python — es exclusiva del dispositivo Android. Es la capa que hace que la clave privada nunca salga del chip de seguridad.
 
@@ -652,7 +806,7 @@ AES-GCM (Galois/Counter Mode) provee **cifrado autenticado**: no solo cifra, tam
 
 ---
 
-## 8. Equivalencia Android ↔ Python
+## 9. Equivalencia Android ↔ Python
 
 | Paso | Android | Python (gen-*.sh) | Resultado |
 |------|---------|-------------------|-----------|
@@ -660,9 +814,10 @@ AES-GCM (Galois/Counter Mode) provee **cifrado autenticado**: no solo cifra, tam
 | Clave pública comprimida | `compressedPublicKey()` manual | `PublicFormat.CompressedPoint` | 33 bytes `[0x02/0x03] + x` |
 | Derivar DID | `DIDManager.getDID()` | `b58encode([0xe7,0x01] + pub_bytes)` | `did:key:zQ3sh...` |
 | Persistir clave privada | `SharedPreferences` + AES-GCM (Keystore) | `.holder-keys` (texto plano) | Solo en el dispositivo |
-| Firmar JWT | `JWTUtil.sign()` (BouncyCastle RFC6979) | `priv_key.sign(ECDSA(SHA256()))` | JWT ES256K compacto |
-| Formato firma | `R‖S` (64 bytes) manual | `decode_dss_signature` + `r.to_bytes + s.to_bytes` | Idéntico |
-| Codificación | `Base64Url.java` propio | `base64.urlsafe_b64encode(...).rstrip(b"=")` | Idéntico |
+| Firmar Proof JWT | `CredentialRequestBuilder.java` + `JWTUtil.sign()` | `gen-proof.sh` | JWT ES256K compacto |
+| Firmar VP JWT | `VPBuilder.java` + `JWTUtil.sign()` | `gen-vp.sh` | JWT ES256K compacto |
+| Formato firma ES256K | `R‖S` (64 bytes) manual (BouncyCastle) | `decode_dss_signature` + `r.to_bytes + s.to_bytes` | Idéntico |
+| Codificación base64url | `Base64Url.java` propio | `base64.urlsafe_b64encode(...).rstrip(b"=")` | Idéntico |
 
 ### Diferencia principal
 
@@ -677,7 +832,9 @@ Los scripts Python guardan la clave privada en `.holder-keys` **en texto plano**
 | `android/.../security/KeyManager.java` | Genera, cifra y carga la clave privada secp256k1 |
 | `android/.../did/DIDManager.java` | Deriva el DID y el key ID desde la clave pública |
 | `android/.../credential/CredentialRequestBuilder.java` | Construye y firma el Proof JWT |
+| `android/.../presentation/VPBuilder.java` | Construye y firma la VP JWT |
 | `android/.../util/JWTUtil.java` | Implementa ES256K y el formato JWT compacto |
 | `android/.../util/Base58.java` | Encoding Base58btc para el DID |
 | `scripts/gen-holder.sh` | Equivalente Python de KeyManager + DIDManager |
-| `scripts/gen-proof.sh` | Equivalente Python de CredentialRequestBuilder + JWTUtil |
+| `scripts/gen-proof.sh` | Equivalente Python de CredentialRequestBuilder (Proof JWT) |
+| `scripts/gen-vp.sh` | Equivalente Python de VPBuilder (VP JWT) — envía al backend y muestra resultado |
